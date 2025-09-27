@@ -19,6 +19,10 @@ from report import save_csv, save_plots, save_summary_md
 import pvlib
 from pvlib.location import Location
 from pvlib.temperature import TEMPERATURE_MODEL_PARAMETERS
+# export/report helper imports
+import json, os, sys, subprocess
+from datetime import datetime
+
 
 st.set_page_config(page_title="Daily EMS Sandbox", layout="wide")
 st.title("🏠 Daily EMS Sandbox")
@@ -1322,7 +1326,6 @@ if st.session_state.get("sim") is not None:
 if st.session_state.get("ems") is not None:
     st.header("B) EMS results")
     render_ems(st.session_state["sim"], st.session_state["ems"])  # keys like "ems_split", "ems_soc"
-
 
 
 
