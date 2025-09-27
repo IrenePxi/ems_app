@@ -986,6 +986,7 @@ if use_wm and st.session_state["wm_dur"] > 0:
     wm_series_prev = block_or_zero(wm_prev, idx_preview, wm_start_prev)
     st.caption(f"≈ {energy_kwh(wm_series_prev):.1f} kWh today")
     note("Washing machine", wm_start_prev, int(st.session_state["wm_dur"]), idx_preview)
+    load_parts.append(block_or_zero(wm_prev, idx_preview, wm_start_prev).rename("washing_machine_kw"))
 
     
 
@@ -1017,6 +1018,7 @@ if use_dw and st.session_state["dw_dur"] > 0:
     dw_series_prev = block_or_zero(dw_prev, idx_preview, dw_start_prev)
     st.caption(f"≈ {energy_kwh(dw_series_prev):.1f} kWh today")
     note("Dishwasher", dw_start_prev, int(st.session_state["dw_dur"]), idx_preview)
+    load_parts.append(block_or_zero(dw_prev, idx_preview, dw_start_prev).rename("dishwasher_kw"))
 
 
 # Dryer
@@ -1047,6 +1049,7 @@ if use_dryer and st.session_state["dr_dur"] > 0:
     dr_series_prev = block_or_zero(dr_prev, idx_preview, dr_start_prev)
     st.caption(f"≈ {energy_kwh(dr_series_prev):.1f} kWh today")
     note("Dryer", dr_start_prev, int(st.session_state["dr_dur"]), idx_preview)
+    load_parts.append(block_or_zero(dr_prev, idx_preview, dr_start_prev).rename("dryer_kw"))
 
 
 # EV
@@ -1078,6 +1081,7 @@ if use_ev and st.session_state["ev_e"] > 0 and st.session_state["ev_p"] > 0:
     ev_series_prev = block_or_zero(ev_prev, idx_preview, ev_start_prev, dt_h)
     st.caption(f"≈ {energy_kwh(ev_series_prev):.1f} kWh today")
     note("EV Charging", ev_start_prev, ev_dur_prev, idx_preview)
+    load_parts.append(block_or_zero(ev_prev, idx_preview, ev_start_prev, dt_h).rename("ev_kw"))
 
 #----------------------get weather-----------------------------
 weather_hr = fetch_weather_open_meteo(
