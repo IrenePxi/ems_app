@@ -2,7 +2,6 @@
 
 import numpy as np
 import json
-import paho.mqtt.client as mqtt
 from scipy.optimize import minimize
 import time
 from datetime import datetime
