@@ -357,6 +357,55 @@ def compute_load_env(day, step_min, objective, weather_hr, use_baseload, use_lig
         load_parts.append(rh)
 
     # WM / DW / Dryer / EV (same scheduling as you currently do)
+        # ---- WM / DW / Dryer / EV (schedule + append) ----
+    # Washing machine
+    if use_wm and int(st.session_state.get("wm_dur", 0)) > 0:
+        wm = WashingMachine(
+            power_w=float(st.session_state["wm_p"]),
+            duration_min=int(st.session_state["wm_dur"]),
+            window_start=st.session_state["wm_ws"],
+            window_end=st.session_state["wm_we"],
+        )
+        wm_start = build_block(signal, wm.feasible_mask(idx), int(st.session_state["wm_dur"]),
+                               st.session_state["wm_sched"], st.session_state.get("wm_manual"), idx)
+        load_parts.append(block_or_zero(wm, idx, wm_start).rename("washing_machine_kw"))
+
+    # Dishwasher
+    if use_dw and int(st.session_state.get("dw_dur", 0)) > 0:
+        dw = Dishwasher(
+            power_w=float(st.session_state["dw_p"]),
+            duration_min=int(st.session_state["dw_dur"]),
+            window_start=st.session_state["dw_ws"],
+            window_end=st.session_state["dw_we"],
+        )
+        dw_start = build_block(signal, dw.feasible_mask(idx), int(st.session_state["dw_dur"]),
+                               st.session_state["dw_sched"], st.session_state.get("dw_manual"), idx)
+        load_parts.append(block_or_zero(dw, idx, dw_start).rename("dishwasher_kw"))
+
+    # Dryer
+    if use_dryer and int(st.session_state.get("dr_dur", 0)) > 0:
+        dr = Dryer(
+            power_w=float(st.session_state["dr_p"]),
+            duration_min=int(st.session_state["dr_dur"]),
+            window_start=st.session_state["dr_ws"],
+            window_end=st.session_state["dr_we"],
+        )
+        dr_start = build_block(signal, dr.feasible_mask(idx), int(st.session_state["dr_dur"]),
+                               st.session_state["dr_sched"], st.session_state.get("dr_manual"), idx)
+        load_parts.append(block_or_zero(dr, idx, dr_start).rename("dryer_kw"))
+
+    # EV (needs dt_h)
+    if use_ev and float(st.session_state.get("ev_e", 0)) > 0 and float(st.session_state.get("ev_p", 0)) > 0:
+        ev = EVCharger(
+            power_kw=float(st.session_state["ev_p"]),
+            energy_target_kwh=float(st.session_state["ev_e"]),
+            window_start=st.session_state["ev_ws"],
+            window_end=st.session_state["ev_we"],
+        )
+        ev_dur = ev.duration_minutes(dt_h)
+        ev_start = build_block(signal, ev.feasible_mask(idx), int(ev_dur),
+                               st.session_state["ev_sched"], st.session_state.get("ev_manual"), idx)
+        load_parts.append(block_or_zero(ev, idx, ev_start, dt_h).rename("ev_kw"))
     # ---- reuse your existing block scheduling code here (omitted for brevity) ----
     # Append each device's series to load_parts when scheduled.
 
@@ -986,7 +1035,7 @@ if use_wm and st.session_state["wm_dur"] > 0:
     wm_series_prev = block_or_zero(wm_prev, idx_preview, wm_start_prev)
     st.caption(f"≈ {energy_kwh(wm_series_prev):.1f} kWh today")
     note("Washing machine", wm_start_prev, int(st.session_state["wm_dur"]), idx_preview)
-    load_parts.append(block_or_zero(wm_prev, idx_preview, wm_start_prev).rename("washing_machine_kw"))
+
 
     
 
@@ -1018,7 +1067,7 @@ if use_dw and st.session_state["dw_dur"] > 0:
     dw_series_prev = block_or_zero(dw_prev, idx_preview, dw_start_prev)
     st.caption(f"≈ {energy_kwh(dw_series_prev):.1f} kWh today")
     note("Dishwasher", dw_start_prev, int(st.session_state["dw_dur"]), idx_preview)
-    load_parts.append(block_or_zero(dw_prev, idx_preview, dw_start_prev).rename("dishwasher_kw"))
+
 
 
 # Dryer
@@ -1049,7 +1098,7 @@ if use_dryer and st.session_state["dr_dur"] > 0:
     dr_series_prev = block_or_zero(dr_prev, idx_preview, dr_start_prev)
     st.caption(f"≈ {energy_kwh(dr_series_prev):.1f} kWh today")
     note("Dryer", dr_start_prev, int(st.session_state["dr_dur"]), idx_preview)
-    load_parts.append(block_or_zero(dr_prev, idx_preview, dr_start_prev).rename("dryer_kw"))
+
 
 
 # EV
@@ -1081,7 +1130,7 @@ if use_ev and st.session_state["ev_e"] > 0 and st.session_state["ev_p"] > 0:
     ev_series_prev = block_or_zero(ev_prev, idx_preview, ev_start_prev, dt_h)
     st.caption(f"≈ {energy_kwh(ev_series_prev):.1f} kWh today")
     note("EV Charging", ev_start_prev, ev_dur_prev, idx_preview)
-    load_parts.append(block_or_zero(ev_prev, idx_preview, ev_start_prev, dt_h).rename("ev_kw"))
+
 
 #----------------------get weather-----------------------------
 weather_hr = fetch_weather_open_meteo(
