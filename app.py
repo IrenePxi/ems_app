@@ -298,7 +298,7 @@ def compute_load_env(day, step_min, objective, weather_hr, use_baseload, use_lig
     dt_h = step_min / 60.0
 
     # signals
-    price, note_price = daily_price_with_note(idx, area="DK1")
+    price_plot, price_hourly, note_price = daily_price_dual(idx, day, area="DK1")
     co2,   note_co2   = daily_co2_with_note(idx, day, area="DK1")
     signal = price if objective == "cost" else (co2 if objective == "co2" else price*0.0)
 
@@ -442,7 +442,7 @@ def compute_load_env(day, step_min, objective, weather_hr, use_baseload, use_lig
         load = pd.Series(0.0, index=idx, name="load_kw")
 
     notes = dict(price=note_price, co2=note_co2, temp=note_temp)
-    return dict(idx=idx, dt_h=dt_h, load=load, pv=pv, price=price, co2=co2, tout=tout_minute,
+    return dict(idx=idx, dt_h=dt_h, load=load, pv=pv, price=price_plot,price_hourly=price_hourly, co2=co2, tout=tout_minute,
                 parts_df=parts_df, notes=notes)
 
 def show_load_env(sim):
@@ -542,27 +542,13 @@ def compare_scenarios(sim, plan_df, cap_kwh, p_max_kw, soc0_kwh, energy_pattern,
     return kpi_base, kpi_pv_only, kpi_batt_only
 
 def _collapse_quarters_to_hourly(s: pd.Series) -> pd.Series:
-    """
-    If the series is quarter-hourly (minutes in {0,15,30,45}),
-    collapse to hourly by taking the mean of each hour.
-    Leaves already-hourly series unchanged.
-    """
     s = s.copy()
     s.index = pd.to_datetime(s.index, errors="coerce")
     s = s[~s.index.isna()].sort_index()
-
-    # quarter-hour detection
-    mins = s.index.minute
-    is_quarterly = set(mins.unique()).issubset({0, 15, 30, 45}) and len(mins.unique()) > 1
-
-    if is_quarterly:
-        # average of the four quarters in each hour
-        s = s.groupby(s.index.floor("H")).mean()
-    else:
-        # if already hourly, just snap to the hour (defensive)
-        s.index = s.index.floor("H")
-
-    # ensure tz-naive, unique, sorted
+    # If quarter-hourly, take mean per hour; if hourly already, just floor
+    minutes = s.index.minute
+    is_q = set(minutes.unique()).issubset({0, 15, 30, 45}) and len(minutes.unique()) > 1
+    s = s.groupby(s.index.floor("H")).mean() if is_q else s.set_axis(s.index.floor("H"))
     if getattr(s.index, "tz", None) is not None:
         s.index = s.index.tz_localize(None)
     s = s[~s.index.duplicated(keep="first")].sort_index()
@@ -799,32 +785,55 @@ def _fetch_elspot_prices(area: str = "DK1") -> pd.DataFrame:
               .sort_values("HourDK")
               .set_index("HourDK")[["price_dkk_per_kwh"]])
 
-def _price_hourly_for_day(day: date, area="DK1") -> pd.Series:
+def daily_price_dual(idx_min: pd.DatetimeIndex, day: date, area="DK1"):
+    """
+    Returns:
+      - price_plot: native-cadence series aligned to idx_min (for charts)
+      - price_hourly: clean hourly series (for EMS/optimization)
+      - note: optional note for the UI
+    """
     tz = "Europe/Copenhagen"
-    start_h = pd.Timestamp(day).tz_localize(tz).replace(minute=0, second=0, microsecond=0)
-    idx_h   = pd.date_range(start=start_h, periods=24, freq="h").tz_localize(None)
+    day_start = pd.Timestamp(day).tz_localize(tz).tz_localize(None)
+    day_end   = day_start + pd.Timedelta(days=1)
+    note = None
 
-    # NEW dataset (quarter-hourly → hourly)
-    newdf = _fetch_dayahead_prices_latest(area=area)
-    if not newdf.empty:
-        s_new_q = newdf["price_dkk_per_kwh"]                     # quarter-hourly
-        s_new_h = _collapse_quarters_to_hourly(s_new_q)          # hourly mean
-        s_day   = s_new_h.loc[(s_new_h.index >= idx_h[0]) & (s_new_h.index <= idx_h[-1])]
-        if s_day.notna().any():
-            return s_day.reindex(idx_h)
+    # Try new dataset (15-min)
+    df_new = _fetch_dayahead_prices_latest(area)
+    if not df_new.empty:
+        s_native = df_new["price_dkk_per_kwh"].loc[(df_new.index >= day_start) & (df_new.index < day_end)]
+    else:
+        s_native = pd.Series(dtype=float)
 
-    # OLD dataset (already hourly)
-    olddf = _fetch_elspot_prices(area)
-    if not olddf.empty:
-        s_old_h = _clean_hourly_index(olddf["price_dkk_per_kwh"])
-        s_day   = s_old_h.loc[(s_old_h.index >= idx_h[0]) & (s_old_h.index <= idx_h[-1])]
-        if s_day.notna().any():
-            return s_day.reindex(idx_h)
+    # Fallback to old dataset (hourly)
+    if s_native.empty:
+        df_old = _fetch_elspot_prices(area)
+        if not df_old.empty:
+            s_native = df_old["price_dkk_per_kwh"].loc[(df_old.index >= day_start) & (df_old.index < day_end)]
 
-    # Nothing → let caller synthesize placeholder
-    return pd.Series(index=idx_h, dtype=float, name="price_dkk_per_kwh")
+    # If still nothing → placeholder
+    if s_native.empty:
+        hrs = (idx_min - idx_min[0]).total_seconds()/3600.0
+        price_plot = pd.Series(2.0 + 0.8*np.sin(2*np.pi*(hrs-17)/24.0), index=idx_min, name="price_dkk_per_kwh")
+        idx_h = pd.date_range(start=day_start, periods=24, freq="h")
+        price_hourly = pd.Series(price_plot.reindex(idx_h).interpolate().bfill().ffill().values,
+                                 index=idx_h, name="price_dkk_per_kwh")
+        note = "No day-ahead price data available for this day. Showing a smooth placeholder curve."
+        return price_plot, price_hourly, note
 
+    # Build plotting series at native resolution → align to minute index for display only
+    price_plot = s_native.reindex(idx_min).interpolate().bfill().ffill().rename("price_dkk_per_kwh")
 
+    # Build hourly series for EMS
+    s_hourly = _collapse_quarters_to_hourly(s_native)
+    idx_h = pd.date_range(start=day_start, periods=24, freq="h")
+    price_hourly = s_hourly.reindex(idx_h).interpolate().bfill().ffill().rename("price_dkk_per_kwh")
+
+    # Optional note if we had gaps
+    miss = int(s_native.isna().sum()) if hasattr(s_native, "isna") else 0
+    if miss > 0:
+        note = f"Filled {miss} missing price points by interpolation."
+
+    return price_plot, price_hourly, note
 
 
 def align_daily_series(idx: pd.DatetimeIndex, s: pd.Series) -> pd.Series:
@@ -904,26 +913,6 @@ def daily_co2_with_note(idx_min: pd.DatetimeIndex, day: date, area="DK1") -> tup
     s_min = s5_aligned.reindex(idx_min).interpolate().bfill().ffill().astype(float)
     return s_min.rename("gCO2_per_kWh"), note
 
-# --- Electricity price (hourly) ---
-def daily_price_with_note(idx_min: pd.DatetimeIndex, area="DK1") -> tuple[pd.Series, str|None]:
-    day0 = idx_min[0].date()
-    s_h_aligned = _price_hourly_for_day(day0, area=area)
-    note = None
-
-    if s_h_aligned.isna().all():
-        # graceful fallback if the day is entirely missing
-        hrs = (idx_min - idx_min[0]).total_seconds()/3600.0
-        placeholder = 2.0 + 0.8*np.sin(2*np.pi*(hrs-17)/24.0)
-        return pd.Series(placeholder, index=idx_min, name="price_dkk_per_kwh"), \
-               "No day-ahead price data available for this day. Showing a smooth placeholder curve."
-
-    miss_h = int(s_h_aligned.isna().sum())
-    if miss_h > 0:
-        s_h_aligned = s_h_aligned.interpolate(limit_direction="both").bfill().ffill()
-        note = f"Filled {miss_h} missing price points by interpolation."
-
-    s_min = s_h_aligned.reindex(idx_min).interpolate().bfill().ffill().astype(float)
-    return s_min.rename("price_dkk_per_kwh"), note
 
 def daily_temperature_with_note(idx_min: pd.DatetimeIndex, weather_hr: pd.DataFrame) -> tuple[pd.Series, str|None]:
     note = None
@@ -1333,7 +1322,7 @@ if ems_col.button("⚡ Run EMS on current simulation", disabled=ems_disabled):
     else:
         # Build hourly df → auto/ manual slots → plan_df exactly as you already do:
         df_hourly = (pd.DataFrame({
-            "load": sim["load"], "pv": sim["pv"], "price": sim["price"],
+            "load": sim["load"], "pv": sim["pv"], "price": sim["price_hourly"],
         }).resample("h").mean()
           .reset_index()
           .rename(columns={"index":"DateTime","price":"ElectricityPrice","load":"Load","pv":"PV"}))
