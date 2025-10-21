@@ -717,26 +717,44 @@ def fetch_co2_prog(area: str = "DK1", horizon_hours: int = 48) -> pd.DataFrame:
               .reset_index(drop=True))
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _fetch_dayahead_prices(area: str = "DK1") -> pd.DataFrame:
-    r = requests.get(f"{EDS_PRICE_URL_NEW}?limit=100000", timeout=40); r.raise_for_status()
-    df = pd.DataFrame.from_records(r.json().get("records", []))
-    if df.empty or "HourDK" not in df or "PriceArea" not in df: return pd.DataFrame()
-    df = df[df["PriceArea"] == area].copy()
-    if df.empty: return pd.DataFrame()
+def _fetch_dayahead_prices_latest(area: str = "DK1", hours: int = 24*10) -> pd.DataFrame:
+    """
+    Pull the most recent ~`hours` rows for DayAheadPrices, area-filtered,
+    explicitly sorted by HourUTC descending so we always include 'today'.
+    """
+    # Pull a bit more than needed; 10 days ~ 240 hours
+    limit = max(500, int(hours * 1.5))
 
+    url = f"{EDS_PRICE_URL_NEW}?limit={limit}&sort=HourUTC%20desc"
+    r = requests.get(url, timeout=40); r.raise_for_status()
+    recs = r.json().get("records", [])
+    if not recs:
+        return pd.DataFrame()
+
+    df = pd.DataFrame.from_records(recs)
+    if df.empty or "PriceArea" not in df.columns or "HourDK" not in df.columns:
+        return pd.DataFrame()
+
+    df = df[df["PriceArea"] == area].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    # Prefer DKK; fallback to EUR with fixed fx if needed
     if "SpotPriceDKK" in df and df["SpotPriceDKK"].notna().any():
-        price = df["SpotPriceDKK"].astype(float) / 1000.0       # DKK/MWh → DKK/kWh
+        price = df["SpotPriceDKK"].astype(float) / 1000.0  # DKK/MWh → DKK/kWh
     elif "SpotPriceEUR" in df and df["SpotPriceEUR"].notna().any():
         eur_to_dkk = 7.45
         price = df["SpotPriceEUR"].astype(float) * eur_to_dkk / 1000.0
     else:
         return pd.DataFrame()
 
-    return (pd.DataFrame({"HourDK": pd.to_datetime(df["HourDK"], errors="coerce"),
-                          "price_dkk_per_kwh": price})
-              .dropna(subset=["HourDK"])
-              .sort_values("HourDK")
-              .set_index("HourDK")[["price_dkk_per_kwh"]])
+    # Clean times and de-dup before indexing
+    df["HourDK"] = pd.to_datetime(df["HourDK"], errors="coerce")
+    df = df.dropna(subset=["HourDK"]).sort_values("HourDK")
+    df = df[~df["HourDK"].duplicated(keep="first")]
+
+    return df.set_index("HourDK")[["PriceArea"]].assign(price_dkk_per_kwh=price)[["price_dkk_per_kwh"]]
+
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -757,20 +775,29 @@ def _price_hourly_for_day(day: date, area="DK1") -> pd.Series:
     start_h = pd.Timestamp(day).tz_localize(tz).replace(minute=0, second=0, microsecond=0)
     idx_h   = pd.date_range(start=start_h, periods=24, freq="h").tz_localize(None)
 
-    # Try DayAhead first
-    newdf = _fetch_dayahead_prices(area)
-    s_new = None if newdf.empty else _clean_hourly_index(newdf["price_dkk_per_kwh"])
-    if s_new is not None and s_new.notna().any():
-        return s_new.reindex(idx_h)
+    # Try NEW dataset (latest-first window)
+    newdf = _fetch_dayahead_prices_latest(area=area, hours=24*10)
+    if not newdf.empty:
+        # select exactly the chosen local day
+        s_new = newdf.loc[
+            (newdf.index >= idx_h[0]) & (newdf.index <= idx_h[-1]),
+            "price_dkk_per_kwh"
+        ]
+        s_new = _clean_hourly_index(s_new)  # de-dup + hour-snap + drop tz
+        if s_new.notna().any():
+            return s_new.reindex(idx_h)
 
-    # Then Elspot (older days)
+    # Fallback to OLD dataset for older dates
     olddf = _fetch_elspot_prices(area)
-    s_old = None if olddf.empty else _clean_hourly_index(olddf["price_dkk_per_kwh"])
-    if s_old is not None and s_old.notna().any():
-        return s_old.reindex(idx_h)
+    if not olddf.empty:
+        s_old = _clean_hourly_index(olddf["price_dkk_per_kwh"])
+        s_old = s_old.loc[(s_old.index >= idx_h[0]) & (s_old.index <= idx_h[-1])]
+        if s_old.notna().any():
+            return s_old.reindex(idx_h)
 
-    # Nothing available
+    # Nothing → empty series (caller will synthesize placeholder)
     return pd.Series(index=idx_h, dtype=float, name="price_dkk_per_kwh")
+
 
 
 def align_daily_series(idx: pd.DatetimeIndex, s: pd.Series) -> pd.Series:
