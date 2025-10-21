@@ -720,15 +720,42 @@ def fetch_co2_prog(area: str = "DK1", horizon_hours: int = 48) -> pd.DataFrame:
 def _fetch_dayahead_prices_latest(area: str = "DK1") -> pd.DataFrame:
     r = requests.get(f"{EDS_PRICE_URL_NEW}?limit=100000", timeout=40); r.raise_for_status()
     df = pd.DataFrame.from_records(r.json().get("records", []))
-    if df.empty or "HourDK" not in df or "PriceArea" not in df or "SpotPriceDKK" not in df:
-        return pd.DataFrame()
-    df = df[df["PriceArea"] == area][["HourDK","SpotPriceDKK"]].copy()
-    df["price_dkk_per_kwh"] = df["SpotPriceDKK"].astype(float) / 1000.0
-    return (df.assign(HourDK=pd.to_datetime(df["HourDK"], errors="coerce"))
-              .dropna(subset=["HourDK"])
-              .sort_values("HourDK")
-              .set_index("HourDK")[["price_dkk_per_kwh"]])
+        # --- Normalize names across schemas ---
+    # Time column
+    if "TimeDK" in df.columns:
+        df = df.rename(columns={"TimeDK": "HourDK"})
+    # Price columns (DKK/MWh and EUR/MWh)
+    if "DayAheadPriceDKK" in df.columns:
+        df = df.rename(columns={"DayAheadPriceDKK": "SpotPriceDKK"})
+    if "DayAheadPriceEUR" in df.columns:
+        df = df.rename(columns={"DayAheadPriceEUR": "SpotPriceEUR"})
 
+    # Must have these now
+    if "HourDK" not in df.columns or "PriceArea" not in df.columns:
+        return pd.DataFrame()
+
+    # Area filter
+    df = df[df["PriceArea"] == area].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    # Build DKK/kWh (prefer DKK, fallback to EUR→DKK)
+    if "SpotPriceDKK" in df.columns and df["SpotPriceDKK"].notna().any():
+        price_dkk_per_kwh = df["SpotPriceDKK"].astype(float) / 1000.0
+    elif "SpotPriceEUR" in df.columns and df["SpotPriceEUR"].notna().any():
+        eur_to_dkk = 7.45  # simple fixed FX fallback
+        price_dkk_per_kwh = df["SpotPriceEUR"].astype(float) * eur_to_dkk / 1000.0
+    else:
+        return pd.DataFrame()
+
+    # Clean, de-dup, sort
+    df["HourDK"] = pd.to_datetime(df["HourDK"], errors="coerce")
+    df = df.dropna(subset=["HourDK"]).sort_values("HourDK")
+    df = df[~df["HourDK"].duplicated(keep="first")]
+
+    # Return same shape as your original
+    df["price_dkk_per_kwh"] = price_dkk_per_kwh.values
+    return df.set_index("HourDK")[["price_dkk_per_kwh"]]
 
 
 @st.cache_data(ttl=300, show_spinner=False)
