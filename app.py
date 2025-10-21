@@ -1379,11 +1379,3 @@ if st.session_state.get("sim") is not None:
 if st.session_state.get("ems") is not None:
     st.header("B) EMS results")
     render_ems(st.session_state["sim"], st.session_state["ems"])  # keys like "ems_split", "ems_soc"
-
-
-
-
-
-
-
-
