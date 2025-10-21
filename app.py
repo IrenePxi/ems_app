@@ -755,22 +755,23 @@ def _fetch_elspot_prices(area: str = "DK1") -> pd.DataFrame:
 def _price_hourly_for_day(day: date, area="DK1") -> pd.Series:
     tz = "Europe/Copenhagen"
     start_h = pd.Timestamp(day).tz_localize(tz).replace(minute=0, second=0, microsecond=0)
-    idx_h = pd.date_range(start=start_h, periods=24, freq="h").tz_localize(None)
+    idx_h   = pd.date_range(start=start_h, periods=24, freq="h").tz_localize(None)
 
     # Try DayAhead first
     newdf = _fetch_dayahead_prices(area)
-    s_new = newdf["price_dkk_per_kwh"].reindex(idx_h) if not newdf.empty else None
+    s_new = None if newdf.empty else _clean_hourly_index(newdf["price_dkk_per_kwh"])
     if s_new is not None and s_new.notna().any():
-        return s_new
+        return s_new.reindex(idx_h)
 
-    # Then Elspot (for older days)
+    # Then Elspot (older days)
     olddf = _fetch_elspot_prices(area)
-    s_old = olddf["price_dkk_per_kwh"].reindex(idx_h) if not olddf.empty else None
+    s_old = None if olddf.empty else _clean_hourly_index(olddf["price_dkk_per_kwh"])
     if s_old is not None and s_old.notna().any():
-        return s_old
+        return s_old.reindex(idx_h)
 
     # Nothing available
     return pd.Series(index=idx_h, dtype=float, name="price_dkk_per_kwh")
+
 
 def align_daily_series(idx: pd.DatetimeIndex, s: pd.Series) -> pd.Series:
     start, end = idx[0], idx[-1]
