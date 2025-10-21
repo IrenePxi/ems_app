@@ -750,7 +750,7 @@ def _price_hourly_for_day(day: date, area="DK1") -> pd.Series:
     idx_h   = pd.date_range(start=start_h, periods=24, freq="h").tz_localize(None)
 
     # Try NEW dataset (latest-first window)
-    newdf = _fetch_dayahead_prices_latest(area=area, hours=24*10)
+    newdf = _fetch_dayahead_prices_latest(area=area)
     if not newdf.empty:
         # select exactly the chosen local day
         s_new = newdf.loc[
