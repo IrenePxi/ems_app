@@ -300,7 +300,7 @@ def compute_load_env(day, step_min, objective, weather_hr, use_baseload, use_lig
     # signals
     price_plot, price_hourly, note_price = daily_price_dual(idx, day, area="DK1")
     co2,   note_co2   = daily_co2_with_note(idx, day, area="DK1")
-    signal = price if objective == "cost" else (co2 if objective == "co2" else price*0.0)
+    signal = price_hourly if objective == "cost" else (co2 if objective == "co2" else price_hourly*0.0)
 
     # temperature
     tout_minute, note_temp = daily_temperature_with_note(idx, weather_hr)
