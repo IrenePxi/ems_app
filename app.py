@@ -717,46 +717,17 @@ def fetch_co2_prog(area: str = "DK1", horizon_hours: int = 48) -> pd.DataFrame:
               .reset_index(drop=True))
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _fetch_dayahead_prices_latest(area: str = "DK1", hours: int = 24*10) -> pd.DataFrame:
-    """
-    Pull a recent chunk of DayAheadPrices for one area.
-    No server-side sort; we filter by PriceArea, then sort locally by HourDK.
-    Returns a DataFrame indexed by HourDK with 'price_dkk_per_kwh'.
-    """
-    # Pull a bit more than needed (e.g., ~10 days)
-    limit = max(500, int(hours * 1.5))
-    # CKAN-style filter: filter={"PriceArea":"DK1"}
-    filt = json.dumps({"PriceArea": area})
-    url = f"{EDS_PRICE_URL_NEW}?limit={limit}&filter={requests.utils.quote(filt)}"
-
-    r = requests.get(url, timeout=40); r.raise_for_status()
-    recs = r.json().get("records", [])
-    if not recs:
+def _fetch_dayahead_prices_latest(area: str = "DK1") -> pd.DataFrame:
+    r = requests.get(f"{EDS_PRICE_URL_NEW}?limit=100000", timeout=40); r.raise_for_status()
+    df = pd.DataFrame.from_records(r.json().get("records", []))
+    if df.empty or "HourDK" not in df or "PriceArea" not in df or "SpotPriceDKK" not in df:
         return pd.DataFrame()
-
-    df = pd.DataFrame.from_records(recs)
-    # Ensure required columns exist
-    if df.empty or "HourDK" not in df.columns:
-        return pd.DataFrame()
-
-    # Choose DKK first; fallback to EUR with a fixed fx
-    if "SpotPriceDKK" in df and df["SpotPriceDKK"].notna().any():
-        price = df["SpotPriceDKK"].astype(float) / 1000.0  # DKK/MWh → DKK/kWh
-    elif "SpotPriceEUR" in df and df["SpotPriceEUR"].notna().any():
-        eur_to_dkk = 7.45
-        price = df["SpotPriceEUR"].astype(float) * eur_to_dkk / 1000.0
-    else:
-        return pd.DataFrame()
-
-    # Clean & de-duplicate time axis
-    df["HourDK"] = pd.to_datetime(df["HourDK"], errors="coerce")
-    df = df.dropna(subset=["HourDK"]).sort_values("HourDK")
-    df = df[~df["HourDK"].duplicated(keep="first")]
-
-    # Keep only the most recent `hours` rows
-    df = df.tail(hours)
-
-    return df.set_index("HourDK")[[]].assign(price_dkk_per_kwh=price).loc[:, ["price_dkk_per_kwh"]]
+    df = df[df["PriceArea"] == area][["HourDK","SpotPriceDKK"]].copy()
+    df["price_dkk_per_kwh"] = df["SpotPriceDKK"].astype(float) / 1000.0
+    return (df.assign(HourDK=pd.to_datetime(df["HourDK"], errors="coerce"))
+              .dropna(subset=["HourDK"])
+              .sort_values("HourDK")
+              .set_index("HourDK")[["price_dkk_per_kwh"]])
 
 
 
