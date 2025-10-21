@@ -541,6 +541,34 @@ def compare_scenarios(sim, plan_df, cap_kwh, p_max_kw, soc0_kwh, energy_pattern,
     # 4) Actual PV+Battery (caller should provide)
     return kpi_base, kpi_pv_only, kpi_batt_only
 
+def _collapse_quarters_to_hourly(s: pd.Series) -> pd.Series:
+    """
+    If the series is quarter-hourly (minutes in {0,15,30,45}),
+    collapse to hourly by taking the mean of each hour.
+    Leaves already-hourly series unchanged.
+    """
+    s = s.copy()
+    s.index = pd.to_datetime(s.index, errors="coerce")
+    s = s[~s.index.isna()].sort_index()
+
+    # quarter-hour detection
+    mins = s.index.minute
+    is_quarterly = set(mins.unique()).issubset({0, 15, 30, 45}) and len(mins.unique()) > 1
+
+    if is_quarterly:
+        # average of the four quarters in each hour
+        s = s.groupby(s.index.floor("H")).mean()
+    else:
+        # if already hourly, just snap to the hour (defensive)
+        s.index = s.index.floor("H")
+
+    # ensure tz-naive, unique, sorted
+    if getattr(s.index, "tz", None) is not None:
+        s.index = s.index.tz_localize(None)
+    s = s[~s.index.duplicated(keep="first")].sort_index()
+    s.name = s.name or "price_dkk_per_kwh"
+    return s
+
 
 def _clean_hourly_index(s: pd.Series) -> pd.Series:
     """Make hourly series safe for reindex: tz-naive, on-the-hour, unique, sorted."""
@@ -776,28 +804,26 @@ def _price_hourly_for_day(day: date, area="DK1") -> pd.Series:
     start_h = pd.Timestamp(day).tz_localize(tz).replace(minute=0, second=0, microsecond=0)
     idx_h   = pd.date_range(start=start_h, periods=24, freq="h").tz_localize(None)
 
-    # Try NEW dataset (latest-first window)
+    # NEW dataset (quarter-hourly → hourly)
     newdf = _fetch_dayahead_prices_latest(area=area)
     if not newdf.empty:
-        # select exactly the chosen local day
-        s_new = newdf.loc[
-            (newdf.index >= idx_h[0]) & (newdf.index <= idx_h[-1]),
-            "price_dkk_per_kwh"
-        ]
-        s_new = _clean_hourly_index(s_new)  # de-dup + hour-snap + drop tz
-        if s_new.notna().any():
-            return s_new.reindex(idx_h)
+        s_new_q = newdf["price_dkk_per_kwh"]                     # quarter-hourly
+        s_new_h = _collapse_quarters_to_hourly(s_new_q)          # hourly mean
+        s_day   = s_new_h.loc[(s_new_h.index >= idx_h[0]) & (s_new_h.index <= idx_h[-1])]
+        if s_day.notna().any():
+            return s_day.reindex(idx_h)
 
-    # Fallback to OLD dataset for older dates
+    # OLD dataset (already hourly)
     olddf = _fetch_elspot_prices(area)
     if not olddf.empty:
-        s_old = _clean_hourly_index(olddf["price_dkk_per_kwh"])
-        s_old = s_old.loc[(s_old.index >= idx_h[0]) & (s_old.index <= idx_h[-1])]
-        if s_old.notna().any():
-            return s_old.reindex(idx_h)
+        s_old_h = _clean_hourly_index(olddf["price_dkk_per_kwh"])
+        s_day   = s_old_h.loc[(s_old_h.index >= idx_h[0]) & (s_old_h.index <= idx_h[-1])]
+        if s_day.notna().any():
+            return s_day.reindex(idx_h)
 
-    # Nothing → empty series (caller will synthesize placeholder)
+    # Nothing → let caller synthesize placeholder
     return pd.Series(index=idx_h, dtype=float, name="price_dkk_per_kwh")
+
 
 
 
