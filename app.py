@@ -719,27 +719,27 @@ def fetch_co2_prog(area: str = "DK1", horizon_hours: int = 48) -> pd.DataFrame:
 @st.cache_data(ttl=300, show_spinner=False)
 def _fetch_dayahead_prices_latest(area: str = "DK1", hours: int = 24*10) -> pd.DataFrame:
     """
-    Pull the most recent ~`hours` rows for DayAheadPrices, area-filtered,
-    explicitly sorted by HourUTC descending so we always include 'today'.
+    Pull a recent chunk of DayAheadPrices for one area.
+    No server-side sort; we filter by PriceArea, then sort locally by HourDK.
+    Returns a DataFrame indexed by HourDK with 'price_dkk_per_kwh'.
     """
-    # Pull a bit more than needed; 10 days ~ 240 hours
+    # Pull a bit more than needed (e.g., ~10 days)
     limit = max(500, int(hours * 1.5))
+    # CKAN-style filter: filter={"PriceArea":"DK1"}
+    filt = json.dumps({"PriceArea": area})
+    url = f"{EDS_PRICE_URL_NEW}?limit={limit}&filter={requests.utils.quote(filt)}"
 
-    url = f"{EDS_PRICE_URL_NEW}?limit={limit}&sort=HourUTC%20desc"
     r = requests.get(url, timeout=40); r.raise_for_status()
     recs = r.json().get("records", [])
     if not recs:
         return pd.DataFrame()
 
     df = pd.DataFrame.from_records(recs)
-    if df.empty or "PriceArea" not in df.columns or "HourDK" not in df.columns:
+    # Ensure required columns exist
+    if df.empty or "HourDK" not in df.columns:
         return pd.DataFrame()
 
-    df = df[df["PriceArea"] == area].copy()
-    if df.empty:
-        return pd.DataFrame()
-
-    # Prefer DKK; fallback to EUR with fixed fx if needed
+    # Choose DKK first; fallback to EUR with a fixed fx
     if "SpotPriceDKK" in df and df["SpotPriceDKK"].notna().any():
         price = df["SpotPriceDKK"].astype(float) / 1000.0  # DKK/MWh → DKK/kWh
     elif "SpotPriceEUR" in df and df["SpotPriceEUR"].notna().any():
@@ -748,12 +748,15 @@ def _fetch_dayahead_prices_latest(area: str = "DK1", hours: int = 24*10) -> pd.D
     else:
         return pd.DataFrame()
 
-    # Clean times and de-dup before indexing
+    # Clean & de-duplicate time axis
     df["HourDK"] = pd.to_datetime(df["HourDK"], errors="coerce")
     df = df.dropna(subset=["HourDK"]).sort_values("HourDK")
     df = df[~df["HourDK"].duplicated(keep="first")]
 
-    return df.set_index("HourDK")[["PriceArea"]].assign(price_dkk_per_kwh=price)[["price_dkk_per_kwh"]]
+    # Keep only the most recent `hours` rows
+    df = df.tail(hours)
+
+    return df.set_index("HourDK")[[]].assign(price_dkk_per_kwh=price).loc[:, ["price_dkk_per_kwh"]]
 
 
 
