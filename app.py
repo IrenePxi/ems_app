@@ -687,7 +687,9 @@ def earliest_fit_start(mask: pd.Series, duration_min: int) -> int | None:
 
 # -------- Energinet EDS helpers (CO₂ & Elspot prices) --------
 EDS_CO2_URL = "https://api.energidataservice.dk/dataset/CO2EmisProg"
-EDS_PRICE_URL = "https://api.energidataservice.dk/dataset/Elspotprices"
+EDS_PRICE_URL_OLD = "https://api.energidataservice.dk/dataset/Elspotprices"     # valid up to 2025-09-30
+EDS_PRICE_URL_NEW = "https://api.energidataservice.dk/dataset/DayAheadPrices"   # valid from 2025-10-01
+_CUTOFF = pd.Timestamp("2025-10-01")
 
 
 
@@ -715,22 +717,60 @@ def fetch_co2_prog(area: str = "DK1", horizon_hours: int = 48) -> pd.DataFrame:
               .reset_index(drop=True))
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_elspot(area: str = "DK1") -> pd.DataFrame:
-    """Hourly day-ahead prices. Normalized to DKK/kWh in column price_dkk_per_kwh."""
-    r = requests.get(f"{EDS_PRICE_URL}?limit=100000", timeout=40); r.raise_for_status()
-    recs = r.json().get("records", [])
-    if not recs: return pd.DataFrame()
-    df = pd.DataFrame.from_records(recs)
-    if not {"HourDK","PriceArea","SpotPriceDKK"}.issubset(df.columns): return pd.DataFrame()
-    df = df[df["PriceArea"] == area][["HourDK","SpotPriceDKK"]].copy()
-    df["HourDK"] = pd.to_datetime(df["HourDK"], errors="coerce")
-    df = df.dropna(subset=["HourDK"]).sort_values("HourDK")
-    # Heuristic: API often gives DKK/MWh. Convert to DKK/kWh when values look large.
-    if df["SpotPriceDKK"].abs().median() > 100:
-        df["price_dkk_per_kwh"] = df["SpotPriceDKK"] / 1000.0
+def _fetch_dayahead_prices(area: str = "DK1") -> pd.DataFrame:
+    r = requests.get(f"{EDS_PRICE_URL_NEW}?limit=100000", timeout=40); r.raise_for_status()
+    df = pd.DataFrame.from_records(r.json().get("records", []))
+    if df.empty or "HourDK" not in df or "PriceArea" not in df: return pd.DataFrame()
+    df = df[df["PriceArea"] == area].copy()
+    if df.empty: return pd.DataFrame()
+
+    if "SpotPriceDKK" in df and df["SpotPriceDKK"].notna().any():
+        price = df["SpotPriceDKK"].astype(float) / 1000.0       # DKK/MWh → DKK/kWh
+    elif "SpotPriceEUR" in df and df["SpotPriceEUR"].notna().any():
+        eur_to_dkk = 7.45
+        price = df["SpotPriceEUR"].astype(float) * eur_to_dkk / 1000.0
     else:
-        df["price_dkk_per_kwh"] = df["SpotPriceDKK"]
-    return df.set_index("HourDK")[["price_dkk_per_kwh"]]
+        return pd.DataFrame()
+
+    return (pd.DataFrame({"HourDK": pd.to_datetime(df["HourDK"], errors="coerce"),
+                          "price_dkk_per_kwh": price})
+              .dropna(subset=["HourDK"])
+              .sort_values("HourDK")
+              .set_index("HourDK")[["price_dkk_per_kwh"]])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_elspot_prices(area: str = "DK1") -> pd.DataFrame:
+    r = requests.get(f"{EDS_PRICE_URL_OLD}?limit=100000", timeout=40); r.raise_for_status()
+    df = pd.DataFrame.from_records(r.json().get("records", []))
+    if df.empty or "HourDK" not in df or "PriceArea" not in df or "SpotPriceDKK" not in df:
+        return pd.DataFrame()
+    df = df[df["PriceArea"] == area][["HourDK","SpotPriceDKK"]].copy()
+    df["price_dkk_per_kwh"] = df["SpotPriceDKK"].astype(float) / 1000.0
+    return (df.assign(HourDK=pd.to_datetime(df["HourDK"], errors="coerce"))
+              .dropna(subset=["HourDK"])
+              .sort_values("HourDK")
+              .set_index("HourDK")[["price_dkk_per_kwh"]])
+
+def _price_hourly_for_day(day: date, area="DK1") -> pd.Series:
+    tz = "Europe/Copenhagen"
+    start_h = pd.Timestamp(day).tz_localize(tz).replace(minute=0, second=0, microsecond=0)
+    idx_h = pd.date_range(start=start_h, periods=24, freq="h").tz_localize(None)
+
+    # Try DayAhead first
+    newdf = _fetch_dayahead_prices(area)
+    s_new = newdf["price_dkk_per_kwh"].reindex(idx_h) if not newdf.empty else None
+    if s_new is not None and s_new.notna().any():
+        return s_new
+
+    # Then Elspot (for older days)
+    olddf = _fetch_elspot_prices(area)
+    s_old = olddf["price_dkk_per_kwh"].reindex(idx_h) if not olddf.empty else None
+    if s_old is not None and s_old.notna().any():
+        return s_old
+
+    # Nothing available
+    return pd.Series(index=idx_h, dtype=float, name="price_dkk_per_kwh")
 
 def align_daily_series(idx: pd.DatetimeIndex, s: pd.Series) -> pd.Series:
     start, end = idx[0], idx[-1]
@@ -811,23 +851,17 @@ def daily_co2_with_note(idx_min: pd.DatetimeIndex, day: date, area="DK1") -> tup
 
 # --- Electricity price (hourly) ---
 def daily_price_with_note(idx_min: pd.DatetimeIndex, area="DK1") -> tuple[pd.Series, str|None]:
-    df = fetch_elspot(area=area)  # HourDK index, price_dkk_per_kwh column
+    day0 = idx_min[0].date()
+    s_h_aligned = _price_hourly_for_day(day0, area=area)
     note = None
 
-    if df.empty or "price_dkk_per_kwh" not in df.columns:
+    if s_h_aligned.isna().all():
+        # graceful fallback if the day is entirely missing
         hrs = (idx_min - idx_min[0]).total_seconds()/3600.0
         placeholder = 2.0 + 0.8*np.sin(2*np.pi*(hrs-17)/24.0)
         return pd.Series(placeholder, index=idx_min, name="price_dkk_per_kwh"), \
-               "No Elspot data available. Showing a smooth placeholder curve."
+               "No day-ahead price data available for this day. Showing a smooth placeholder curve."
 
-    s_h = _clean_hourly_index(df["price_dkk_per_kwh"].astype(float))
-
-    start_h = idx_min[0].replace(minute=0, second=0, microsecond=0)
-    end_h   = idx_min[-1].floor("h")
-    idx_h   = pd.date_range(start=start_h, end=end_h, freq="h")
-
-    # align on clean hourly index
-    s_h_aligned = s_h.reindex(idx_h)
     miss_h = int(s_h_aligned.isna().sum())
     if miss_h > 0:
         s_h_aligned = s_h_aligned.interpolate(limit_direction="both").bfill().ffill()
