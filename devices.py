@@ -4,6 +4,8 @@ from datetime import time
 import numpy as np
 import pandas as pd
 
+
+
 def _window_mask(idx: pd.DatetimeIndex, start: time, end: time) -> np.ndarray:
     mins = idx.hour*60 + idx.minute
     s = start.hour*60 + start.minute
@@ -193,60 +195,129 @@ class BaseloadSpec:
         return pd.Series(total_w / 1000.0, index=idx, name=self.name)
 
 # ---------- Weather-aware HP ----------
+
 @dataclass
 class WeatherHP:
     name: str = "heat_pump_weather"
-    # simple inputs
-    ua_kw_per_c: float = 0.25
-    t_set_c: float = 21.0
-    q_rated_kw: float = 6.0
-    cop_at_7c: float = 3.2            # simple-mode input
 
-    # advanced (optional override)
-    cop_a: float | None = None
-    cop_b: float | None = None        # per °C
+    # Building + HP parameters
+    ua_kw_per_c: float = 0.25          # heat loss coefficient [kW/°C]
+    t_set_c: float = 21.0              # thermostat setpoint [°C]
+    q_rated_kw: float = 6.0            # HP rated thermal output [kW]
+
+    # COP parameters
+    cop_at_7c: float = 3.2
+    cop_a: float | None = None         # if both a,b given -> COP = a + b * Tout
+    cop_b: float | None = None
     cop_min: float = 1.6
     cop_max: float = 4.2
-    defrost: bool = True
+    defrost: bool = True               # simple penalty below ~3°C
 
+    # Thermostat + building dynamics
+    hyst_band_c: float = 0.6           # thermostat hysteresis width [°C] (±0.3°C)
+    C_th_kwh_per_c: float = 3.0        # thermal capacitance of building [kWh/°C]
+    Ti0_c: float = 21.0                # initial indoor temp [°C]
+    internal_gains_kw: float = 0.0     # constant internal gains (optional) [kW]
+
+    # Optional: minimum ON/OFF time (set both to 0 to disable)
+    min_on_min: int = 0
+    min_off_min: int = 0
+
+    # ---- helpers ----
     def _cop_params(self):
-        # If a,b given → use them; else derive from cop_at_7c with a gentle slope
         if self.cop_a is not None and self.cop_b is not None:
             return float(self.cop_a), float(self.cop_b)
-        b = 0.05   # per °C (sensible default)
-        a = self.cop_at_7c - b*7.0
+        b = 0.05
+        a = self.cop_at_7c - b * 7.0
         return a, b
 
-    def series_kw(self, idx, tout_c):
-        T_out = np.array(tout_c)
+    def _cop(self, Tout: np.ndarray) -> np.ndarray:
+        a, b = self._cop_params()
+        cop = np.clip(a + b * Tout, self.cop_min, self.cop_max)
+        if self.defrost:
+            cop = cop * np.where(Tout < 3.0, 0.92, 1.0)
+        return np.maximum(cop, 1e-6)
+
+    def _min_period_guard(self, state_hist: np.ndarray, state: bool, t: int, dt_min: float) -> bool:
+        """Return True if we must keep current 'state' to respect min on/off time."""
+        if self.min_on_min <= 0 and self.min_off_min <= 0:
+            return False
+        # how long (minutes) we've been in current state?
+        run = 0
+        i = t - 1
+        while i >= 0 and state_hist[i] == state:
+            run += 1
+            i -= 1
+        held_min = run * dt_min
+        if state and self.min_on_min > 0:
+            return held_min < self.min_on_min
+        if (not state) and self.min_off_min > 0:
+            return held_min < self.min_off_min
+        return False
+
+    # ---- main ----
+    def series_kw(self, idx: pd.DatetimeIndex, tout_c: pd.Series) -> pd.Series:
+        # Align inputs
+        tout = pd.Series(tout_c, index=idx).astype(float)
+        n = len(idx)
+        if n == 0:
+            return pd.Series(dtype=float, index=idx, name=self.name)
+
+        # time step (minutes / hours)
+        if n > 1:
+            dt_min = (idx[1] - idx[0]).total_seconds() / 60.0
+        else:
+            dt_min = 1.0
+        dt_h = dt_min / 60.0
+
+        T_out = tout.values
         cop = self._cop(T_out)
-        Ti = np.zeros(len(idx))
-        P = np.zeros(len(idx))
 
-        # parameters
-        C = 3.0      # kWh/°C (house thermal capacitance)
-        UA = self.ua_kw_per_c
-        Tset = self.t_set_c
-        dT = 0.6     # hysteresis band (°C)
-        dt_h = (idx[1]-idx[0]).total_seconds()/3600.0
+        # Storage for results
+        Ti = np.zeros(n, dtype=float)
+        P  = np.zeros(n, dtype=float)        # electrical power [kW]
+        state_hist = np.zeros(n, dtype=bool) # ON/OFF for min-period guard
 
-        hp_on = False
-        Ti[0] = Tset  # start at setpoint
+        # initial indoor temp near setpoint
+        Ti[0] = float(self.Ti0_c)
 
-        for k in range(1, len(idx)):
-            # thermostat control
-            if Ti[k-1] < Tset - dT/2:
-                hp_on = True
-            elif Ti[k-1] > Tset + dT/2:
-                hp_on = False
+        # thermostat thresholds
+        low  = self.t_set_c - self.hyst_band_c/2.0
+        high = self.t_set_c + self.hyst_band_c/2.0
 
-            Q_hp = self.q_rated_kw if hp_on else 0.0
-            P[k] = Q_hp / cop[k] if hp_on else 0.0
+        hp_on = Ti[0] < low
 
-            # building temperature evolution
-            dTi = (Q_hp - UA*(Ti[k-1] - T_out[k]))/C * dt_h
+        # step through time
+        for k in range(1, n):
+            # thermostat with optional min-on/off guard
+            desired_on = hp_on
+            if Ti[k-1] < low:
+                desired_on = True
+            elif Ti[k-1] > high:
+                desired_on = False
+
+            # Enforce minimum ON/OFF if requested
+            if self._min_period_guard(state_hist, hp_on, k, dt_min):
+                desired_on = hp_on
+
+            hp_on = desired_on
+            state_hist[k] = hp_on
+
+            # Thermal output and electrical input
+            Q_hp = self.q_rated_kw if hp_on else 0.0                      # kW thermal
+            P[k] = Q_hp / cop[k] if hp_on else 0.0                        # kW electric
+
+            # Building temperature update (Euler):
+            # C * dTi/dt = Q_hp + Q_int - UA*(Ti - Tout)
+            heat_loss = self.ua_kw_per_c * (Ti[k-1] - T_out[k])
+            dTi = (Q_hp + self.internal_gains_kw - heat_loss) / max(self.C_th_kwh_per_c, 1e-6) * dt_h
             Ti[k] = Ti[k-1] + dTi
 
         return pd.Series(P, index=idx, name=self.name)
 
-
+    # (Optional) helper if you want the indoor temperature trace for debugging/plots
+    def simulate_with_Ti(self, idx: pd.DatetimeIndex, tout_c: pd.Series) -> tuple[pd.Series, pd.Series]:
+        sP = self.series_kw(idx, tout_c)
+        # Re-run quickly to extract Ti (kept simple: call again with a tiny change)
+        # If you want, you can refactor to compute Ti & P in one pass and return both.
+        return sP, pd.Series([], dtype=float)  # stub to keep interface minimal
