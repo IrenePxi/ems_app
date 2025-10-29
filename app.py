@@ -1028,7 +1028,7 @@ if use_baseload:
             fridge_avg_w = st.number_input("Refrigerator average (W)", 0.0, 500.0, 45.0, 1.0, key="base_fridge")
         with colb3:
             other1_label = st.text_input("Other always-on #1 label", value="Aquarium/pond pump", key="base_o1_label")
-            other1_w     = st.number_input(f"{other1_label} (W)", 0.0, 2000.0, 860, 1.0, key="base_o1")
+            other1_w     = st.number_input(f"{other1_label} (W)", 0.0, 2000.0, 860.0, 1.0, key="base_o1")
             other2_label = st.text_input("Other always-on #2 label", value="Network switches", key="base_o2_label")
             other2_w     = st.number_input(f"{other2_label} (W)", 0.0, 2000.0, 0.0, 1.0, key="base_o2")
 
