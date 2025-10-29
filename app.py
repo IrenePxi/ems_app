@@ -1049,7 +1049,7 @@ if use_baseload:
     st.caption(f"≈ {energy_kwh(base_prev):.1f} kWh today")
 
 # Lights
-use_lights = st.checkbox("Lights", value=True, key="lights_on")
+use_lights = st.checkbox("Lights (default 18:00-23:30)", value=True, key="lights_on")
 if use_lights:
     with st.expander("Lights settings"):
         lights_count = st.number_input("Count", 0, 100, 5, 1, key="lights_count")
