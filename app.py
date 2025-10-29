@@ -26,6 +26,7 @@ from datetime import datetime
 
 st.set_page_config(page_title="Daily EMS Sandbox", layout="wide")
 st.title("🏠 Daily EMS Sandbox")
+st.header("This app lets you explore your household daily energy behavior.")
 #----------------------------------------------------------------------------------------------------
 # --- at the top, after imports ---
 if "sim" not in st.session_state:  # stores load/env results
