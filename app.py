@@ -27,6 +27,12 @@ from datetime import datetime
 st.set_page_config(page_title="Daily EMS Sandbox", layout="wide")
 st.title("🏠 Daily EMS Sandbox")
 st.header("This app lets you explore your household daily energy behavior.")
+
+st.header("you can:\\
+• Select daily activities and visualize the resulting load profile.\\
+• Access real-time environmental data (temperature, CO₂ intensity, electricity price).\\
+• Receive EMS recommendations for when to operate household devices for optimal cost and emissions.\\
+• Input custom settings for energy storage, generation, and inverters to simulate and compare system performance under different configurations. \\)
 #----------------------------------------------------------------------------------------------------
 # --- at the top, after imports ---
 if "sim" not in st.session_state:  # stores load/env results
