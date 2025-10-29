@@ -451,7 +451,6 @@ def compute_load_env(day, step_min, objective, weather_hr, use_baseload, use_lig
 
 
 
-        load_parts.append(hp.series_kw(idx, tout_minute))
 
     else:
         pass  
