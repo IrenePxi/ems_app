@@ -217,14 +217,36 @@ class WeatherHP:
         a = self.cop_at_7c - b*7.0
         return a, b
 
-    def series_kw(self, idx: pd.DatetimeIndex, tout_c: pd.Series) -> pd.Series:
-        tout = pd.Series(tout_c, index=idx).astype(float)
-        q_heat = self.ua_kw_per_c * np.maximum(self.t_set_c - tout.values, 0.0)
-        a, b = self._cop_params()
-        cop = np.clip(a + b * tout.values, self.cop_min, self.cop_max)
-        if self.defrost:
-            cop = cop * np.where(tout.values < 3.0, 0.92, 1.0)
-        q_served = np.minimum(q_heat, self.q_rated_kw)
-        p = q_served / np.maximum(cop, 1e-6)
-        return pd.Series(p, index=idx, name=self.name)
+    def series_kw(self, idx, tout_c):
+        T_out = np.array(tout_c)
+        cop = self._cop(T_out)
+        Ti = np.zeros(len(idx))
+        P = np.zeros(len(idx))
+
+        # parameters
+        C = 3.0      # kWh/°C (house thermal capacitance)
+        UA = self.ua_kw_per_c
+        Tset = self.t_set_c
+        dT = 0.6     # hysteresis band (°C)
+        dt_h = (idx[1]-idx[0]).total_seconds()/3600.0
+
+        hp_on = False
+        Ti[0] = Tset  # start at setpoint
+
+        for k in range(1, len(idx)):
+            # thermostat control
+            if Ti[k-1] < Tset - dT/2:
+                hp_on = True
+            elif Ti[k-1] > Tset + dT/2:
+                hp_on = False
+
+            Q_hp = self.q_rated_kw if hp_on else 0.0
+            P[k] = Q_hp / cop[k] if hp_on else 0.0
+
+            # building temperature evolution
+            dTi = (Q_hp - UA*(Ti[k-1] - T_out[k]))/C * dt_h
+            Ti[k] = Ti[k-1] + dTi
+
+        return pd.Series(P, index=idx, name=self.name)
+
 
