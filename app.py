@@ -433,11 +433,21 @@ def compute_load_env(day, step_min, objective, weather_hr, use_baseload, use_lig
             t_set_c=float(st.session_state["hp_tset"]),
             q_rated_kw=float(st.session_state["hp_qr"]),
             cop_at_7c=float(st.session_state["hp_cop7"]),
-            cop_a=... , cop_b=... ,
-            cop_min=..., cop_max=..., defrost=...,
-            # optional for realism:
-            C_th_kwh_per_c=3.0, hyst_band_c=0.6, Ti0_c=st.session_state["hp_tset"],
+            cop_a=float(st.session_state["hp_copa"]) if st.session_state.get("hp_adv_on") else None,
+            cop_b=float(st.session_state["hp_copb"]) if st.session_state.get("hp_adv_on") else None,
+            cop_min=float(st.session_state.get("hp_copmin", 1.6)),
+            cop_max=float(st.session_state.get("hp_copmax", 4.2)),
+            defrost=bool(st.session_state.get("hp_def", True)),
+            # hysteresis model params:
+            C_th_kwh_per_c=3.0,
+            hyst_band_c=0.6,
+            Ti0_c=float(st.session_state["hp_tset"]),
+            internal_gains_kw=0.0,
+            # optional anti–short-cycle (keep 0 to disable)
+            min_on_min=0,
+            min_off_min=0,
         )
+
         load_parts.append(hp.series_kw(idx, tout_minute))
 
     else:
