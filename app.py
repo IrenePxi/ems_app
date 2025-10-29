@@ -327,7 +327,7 @@ def compute_load_env(day, step_min, objective, weather_hr, use_baseload, use_lig
             standby_w=st.session_state.get("base_standby", 60.0),
             dhw_recirc_w=st.session_state.get("base_dhw", 0.0),
             fridge_avg_w=st.session_state.get("base_fridge", 45.0),
-            other1_w=st.session_state.get("base_o1", 0.0),
+            other1_w=st.session_state.get("base_o1", 860.0),
             other2_w=st.session_state.get("base_o2", 0.0),
         ).series_kw(idx)
         load_parts.append(base.rename("baseload_kw"))
