@@ -1068,7 +1068,7 @@ if use_lights and st.session_state["lights_count"]>0:
 
 
 # Range hood
-use_hood = st.checkbox("Range hood", value=True, key="hood_on")
+use_hood = st.checkbox("Range hood (default 12:30 and 18:00)", value=True, key="hood_on")
 if use_hood:
     with st.expander("Range hood settings"):
         hood_power = st.number_input("Power (W)", 50, 1000, 150, 10, key="hood_p")
