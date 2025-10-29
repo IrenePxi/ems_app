@@ -429,24 +429,25 @@ def compute_load_env(day, step_min, objective, weather_hr, use_baseload, use_lig
             tout = pd.Series(0.0, index=idx, name="Tout_C")
 
         hp = WeatherHP(
-            ua_kw_per_c=float(st.session_state["hp_ua"]),
-            t_set_c=float(st.session_state["hp_tset"]),
-            q_rated_kw=float(st.session_state["hp_qr"]),
+            ua_kw_per_c=float(st.session_state["hp_ua"]),     # try 0.25
+            t_set_c=float(st.session_state["hp_tset"]),       # e.g. 21
+            q_rated_kw=float(st.session_state["hp_qr"]),      # try 6.0
             cop_at_7c=float(st.session_state["hp_cop7"]),
-            cop_a=float(st.session_state["hp_copa"]) if st.session_state.get("hp_adv_on") else None,
-            cop_b=float(st.session_state["hp_copb"]) if st.session_state.get("hp_adv_on") else None,
             cop_min=float(st.session_state.get("hp_copmin", 1.6)),
             cop_max=float(st.session_state.get("hp_copmax", 4.2)),
             defrost=bool(st.session_state.get("hp_def", True)),
-            # hysteresis model params:
-            C_th_kwh_per_c=3.0,
+
+            # hysteresis model params
             hyst_band_c=0.6,
+            C_th_kwh_per_c=2.5,
             Ti0_c=float(st.session_state["hp_tset"]),
-            internal_gains_kw=0.0,
-            # optional anti–short-cycle (keep 0 to disable)
-            min_on_min=0,
-            min_off_min=0,
+            p_off_kw=0.05,
+
+            # optional compressor protection
+            min_on_min=3,
+            min_off_min=5,
         )
+
 
         load_parts.append(hp.series_kw(idx, tout_minute))
 

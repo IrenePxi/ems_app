@@ -218,7 +218,11 @@ class WeatherHP:
     C_th_kwh_per_c: float = 3.0        # thermal capacitance of building [kWh/°C]
     Ti0_c: float = 21.0                # initial indoor temp [°C]
     internal_gains_kw: float = 0.0     # constant internal gains (optional) [kW]
+    
+    p_off_kw: float = 0.05   # 50 W standby when OFF
 
+
+    
     # Optional: minimum ON/OFF time (set both to 0 to disable)
     min_on_min: int = 0
     min_off_min: int = 0
@@ -304,8 +308,8 @@ class WeatherHP:
             state_hist[k] = hp_on
 
             # Thermal output and electrical input
-            Q_hp = self.q_rated_kw if hp_on else 0.0                      # kW thermal
-            P[k] = Q_hp / cop[k] if hp_on else 0.0                        # kW electric
+            Q_hp = self.q_rated_kw if hp_on else 0.0
+            P[k]  = (Q_hp / cop[k]) if hp_on else self.p_off_kw
 
             # Building temperature update (Euler):
             # C * dTi/dt = Q_hp + Q_int - UA*(Ti - Tout)
