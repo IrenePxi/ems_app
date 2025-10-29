@@ -1015,7 +1015,7 @@ def preview_block_start(feas_mask: pd.Series, duration_min: int, sched_mode: str
 st.markdown("## 1. ⚡ Power Loads")
 
 # Baseload
-use_baseload = st.checkbox("Baseload", value=True, key="base_on")
+use_baseload = st.checkbox("Baseload (runs 24 hours a day)", value=True, key="base_on")
 if use_baseload:
     with st.expander("Baseload settings", expanded=False):
         colb1, colb2, colb3 = st.columns(3)
