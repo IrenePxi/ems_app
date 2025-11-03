@@ -198,175 +198,130 @@ class BaseloadSpec:
 
 @dataclass
 class WeatherHP:
-    # ---- names / plotting ----
     name: str = "heat_pump_weather"
 
-    # ---- envelope + setpoint (base) ----
-    ua_kw_per_c: float = 0.25            # kW/°C, base heat loss coeff
-    t_set_c: float = 21.0                # °C, fallback constant setpoint
-    C_th_kwh_per_c: float = 0.20         # kWh/°C, building thermal mass
+    # Building + HP parameters
+    ua_kw_per_c: float = 0.25          # heat loss coefficient [kW/°C]
+    t_set_c: float = 21.0              # thermostat setpoint [°C]
+    q_rated_kw: float = 6.0            # HP rated thermal output [kW]
 
-    # Allow time-varying inputs (Series, optional)
-    tset_series_c: float | pd.Series | None = None   # °C vs time
-    internal_gains_kw: float | pd.Series = 0.0       # kW vs time (solar + people)
-    wind_ms: float | pd.Series = 0.0                 # m/s vs time
-    ua_wind_factor: float = 0.03                     # +3% UA per 1 m/s (tune 0–0.05)
-
-    # ---- machine ----
-    q_rated_kw: float = 6.0             # thermal capacity at ON
-    cop_at_7c: float = 3.0              # simple COP anchor (if no (a,b))
-    cop_a: float | None = None          # COP = a + b * Tout
+    # COP parameters
+    cop_at_7c: float = 3.2
+    cop_a: float | None = None         # if both a,b given -> COP = a + b * Tout
     cop_b: float | None = None
     cop_min: float = 1.6
     cop_max: float = 4.2
-    defrost: bool = True                # small COP penalty below 3°C
-    defrost_mult: float = 0.92
+    defrost: bool = True               # simple penalty below ~3°C
 
-    # ---- thermostat behavior ----
-    hyst_band_c: float = 0.8            # total band (±0.4°C)
-    min_on_min: int = 4                 # compressor protection
-    min_off_min: int = 10
-    debounce_steps: int = 2             # require N consecutive steps beyond band to switch
+    # Thermostat + building dynamics
+    hyst_band_c: float = 0.6           # thermostat hysteresis width [°C] (±0.3°C)
+    C_th_kwh_per_c: float = 3.0        # thermal capacitance of building [kWh/°C]
+    Ti0_c: float = 21.0                # initial indoor temp [°C]
+    internal_gains_kw: float = 0.0     # constant internal gains (optional) [kW]
+    
+    p_off_kw: float = 0.05   # 50 W standby when OFF
 
-    # ---- power when OFF ----
-    p_off_kw: float = 0.05              # standby/crankcase/pumps
 
-    # ---- integration ----
-    Ti0_c: float = 21.0                 # initial indoor temp
+    
+    # Optional: minimum ON/OFF time (set both to 0 to disable)
+    min_on_min: int = 0
+    min_off_min: int = 0
 
-    # ---- optional DHW/defrost spikes ----
-    dhw_windows: list[tuple[pd.Timestamp, pd.Timestamp]] | None = None
-    dhw_boost_factor: float = 1.4       # Q_hp boost during DHW
-    dhw_ignore_thermostat: bool = True  # heat regardless of room band during DHW
-
-    # ------------------------------------------------------------------
-    def _cop_params(self) -> tuple[float, float]:
+    # ---- helpers ----
+    def _cop_params(self):
         if self.cop_a is not None and self.cop_b is not None:
             return float(self.cop_a), float(self.cop_b)
-        # derive a,b from cop_at_7c with a gentle slope
         b = 0.05
-        a = float(self.cop_at_7c) - b * 7.0
+        a = self.cop_at_7c - b * 7.0
         return a, b
 
-    def _as_series(self, x, idx, name=None) -> pd.Series:
-        if isinstance(x, pd.Series):
-            s = x.reindex(idx).interpolate().bfill().ffill()
-        else:
-            s = pd.Series(float(x), index=idx)
-        if name:
-            s.name = name
-        return s.astype(float)
+    def _cop(self, Tout: np.ndarray) -> np.ndarray:
+        a, b = self._cop_params()
+        cop = np.clip(a + b * Tout, self.cop_min, self.cop_max)
+        if self.defrost:
+            cop = cop * np.where(Tout < 3.0, 0.92, 1.0)
+        return np.maximum(cop, 1e-6)
 
-    def _in_any_window(self, t: pd.Timestamp) -> bool:
-        if not self.dhw_windows:
+    def _min_period_guard(self, state_hist: np.ndarray, state: bool, t: int, dt_min: float) -> bool:
+        """Return True if we must keep current 'state' to respect min on/off time."""
+        if self.min_on_min <= 0 and self.min_off_min <= 0:
             return False
-        for s, e in self.dhw_windows:
-            if s <= t < e:
-                return True
+        # how long (minutes) we've been in current state?
+        run = 0
+        i = t - 1
+        while i >= 0 and state_hist[i] == state:
+            run += 1
+            i -= 1
+        held_min = run * dt_min
+        if state and self.min_on_min > 0:
+            return held_min < self.min_on_min
+        if (not state) and self.min_off_min > 0:
+            return held_min < self.min_off_min
         return False
 
+    # ---- main ----
     def series_kw(self, idx: pd.DatetimeIndex, tout_c: pd.Series) -> pd.Series:
-        """Return electrical power (kW), incl. standby when OFF."""
-        idx = pd.DatetimeIndex(idx)  # ensure proper index
-        dt_h = (idx[1] - idx[0]).total_seconds()/3600.0 if len(idx) > 1 else 1.0/60.0
-
-        # Inputs as time series
-        Tout = self._as_series(tout_c, idx, "Tout_C").values
-        Gains = self._as_series(self.internal_gains_kw, idx, "Qg_kw").values
-        Wind = self._as_series(self.wind_ms, idx, "wind_ms").values
-        Tset_series = self._as_series(self.tset_series_c if self.tset_series_c is not None else self.t_set_c,
-                                      idx, "Tset_C").values
-
-        # Effective UA with wind
-        UAeff = float(self.ua_kw_per_c) * (1.0 + float(self.ua_wind_factor) * np.maximum(Wind, 0.0))
-
-        # COP(Tout)
-        a, b = self._cop_params()
-        COP = np.clip(a + b * Tout, self.cop_min, self.cop_max)
-        if self.defrost:
-            COP = COP * np.where(Tout < 3.0, self.defrost_mult, 1.0)
-
-        # Thermostat thresholds
-        half = float(self.hyst_band_c) / 2.0
-        low = Tset_series - half
-        high = Tset_series + half
-
-        # Arrays to fill
+        # Align inputs
+        tout = pd.Series(tout_c, index=idx).astype(float)
         n = len(idx)
-        Ti = np.empty(n, dtype=float)
+        if n == 0:
+            return pd.Series(dtype=float, index=idx, name=self.name)
+
+        # time step (minutes / hours)
+        if n > 1:
+            dt_min = (idx[1] - idx[0]).total_seconds() / 60.0
+        else:
+            dt_min = 1.0
+        dt_h = dt_min / 60.0
+
+        T_out = tout.values
+        cop = self._cop(T_out)
+
+        # Storage for results
+        Ti = np.zeros(n, dtype=float)
+        P  = np.zeros(n, dtype=float)        # electrical power [kW]
+        state_hist = np.zeros(n, dtype=bool) # ON/OFF for min-period guard
+
+        # initial indoor temp near setpoint
         Ti[0] = float(self.Ti0_c)
-        P = np.empty(n, dtype=float)   # electric power
-        on = np.zeros(n, dtype=bool)
 
-        # Guards
-        min_on_steps = int(round(self.min_on_min / (dt_h*60.0))) if self.min_on_min > 0 else 0
-        min_off_steps = int(round(self.min_off_min / (dt_h*60.0))) if self.min_off_min > 0 else 0
-        on_timer = 0
-        off_timer = 0
-        above_cnt = 0
-        below_cnt = 0
+        # thermostat thresholds
+        low  = self.t_set_c - self.hyst_band_c/2.0
+        high = self.t_set_c + self.hyst_band_c/2.0
 
-        for k in range(n):
-            tnow = idx[k]
+        hp_on = Ti[0] < low
 
-            # During DHW/defrost windows, optionally force heating regardless of thermostat
-            dhw_now = self._in_any_window(tnow)
-            if k == 0:
-                # decide initial state based on band
-                if Ti[0] < low[0]:
-                    on[0] = True
-                    on_timer = 1
-                    off_timer = 0
-                else:
-                    on[0] = False
-                    on_timer = 0
-                    off_timer = 1
+        # step through time
+        for k in range(1, n):
+            # thermostat with optional min-on/off guard
+            desired_on = hp_on
+            if Ti[k-1] < low:
+                desired_on = True
+            elif Ti[k-1] > high:
+                desired_on = False
 
-            if k > 0:
-                desired_on = on[k-1]
-                # Debounced crossings only when not in DHW
-                if not dhw_now:
-                    if Ti[k-1] < low[k-1]:
-                        below_cnt += 1
-                        above_cnt = 0
-                    elif Ti[k-1] > high[k-1]:
-                        above_cnt += 1
-                        below_cnt = 0
-                    else:
-                        above_cnt = below_cnt = 0
+            # Enforce minimum ON/OFF if requested
+            if self._min_period_guard(state_hist, hp_on, k, dt_min):
+                desired_on = hp_on
 
-                    if not on[k-1] and below_cnt >= self.debounce_steps and off_timer >= min_off_steps:
-                        desired_on = True
-                        below_cnt = 0
-                        off_timer = 0
-                    elif on[k-1] and above_cnt >= self.debounce_steps and on_timer >= min_on_steps:
-                        desired_on = False
-                        above_cnt = 0
-                        on_timer = 0
-                else:
-                    # DHW ignores thermostat (if requested)
-                    desired_on = True if self.dhw_ignore_thermostat else on[k-1]
+            hp_on = desired_on
+            state_hist[k] = hp_on
 
-                on[k] = desired_on
-                # update timers
-                if on[k]:
-                    on_timer += 1
-                    off_timer = 0
-                else:
-                    off_timer += 1
-                    on_timer = 0
+            # Thermal output and electrical input
+            Q_hp = self.q_rated_kw if hp_on else 0.0
+            P[k]  = (Q_hp / cop[k]) if hp_on else self.p_off_kw
 
-            # Heat pump thermal output this step
-            Q_hp = self.q_rated_kw if on[k] else 0.0
-            if dhw_now and on[k]:
-                Q_hp *= float(self.dhw_boost_factor)
-
-            # Indoor temperature update (first-order)
-            heat_loss = UAeff[k] * (Ti[k-1 if k>0 else 0] - Tout[k])
-            dTi = (Q_hp + Gains[k] - heat_loss) / max(self.C_th_kwh_per_c, 1e-6) * dt_h
-            Ti[k] = Ti[k-1 if k>0 else 0] + dTi
-
-            # Electrical power
-            P[k] = (Q_hp / max(COP[k], 1e-6)) if on[k] else float(self.p_off_kw)
+            # Building temperature update (Euler):
+            # C * dTi/dt = Q_hp + Q_int - UA*(Ti - Tout)
+            heat_loss = self.ua_kw_per_c * (Ti[k-1] - T_out[k])
+            dTi = (Q_hp + self.internal_gains_kw - heat_loss) / max(self.C_th_kwh_per_c, 1e-6) * dt_h
+            Ti[k] = Ti[k-1] + dTi
 
         return pd.Series(P, index=idx, name=self.name)
+
+    # (Optional) helper if you want the indoor temperature trace for debugging/plots
+    def simulate_with_Ti(self, idx: pd.DatetimeIndex, tout_c: pd.Series) -> tuple[pd.Series, pd.Series]:
+        sP = self.series_kw(idx, tout_c)
+        # Re-run quickly to extract Ti (kept simple: call again with a tiny change)
+        # If you want, you can refactor to compute Ti & P in one pass and return both.
+        return sP, pd.Series([], dtype=float)  # stub to keep interface minimal
