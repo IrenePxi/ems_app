@@ -428,9 +428,46 @@ def compute_load_env(day, step_min, objective, weather_hr, use_baseload, use_lig
         else:
             tout = pd.Series(0.0, index=idx, name="Tout_C")
 
+        # --- Build time-varying inputs (simple but effective) ---
+        # Solar/internal gains (kW)
+        ghi = None
+        if (weather_hr is not None) and (not weather_hr.empty) and ("ghi" in weather_hr):
+            ghi = weather_hr["ghi"].clip(lower=0)           # W/m²
+        else:
+            ghi = pd.Series(0.0, index=pd.date_range(idx[0].floor("H"), idx[-1].ceil("H"), freq="H"))
+
+        sol_kw = 0.0005 * ghi                                # ~0..0.5 kW for 0..1000 W/m² (tune)
+        people_kw = 0.2                                      # baseline internal gains
+        cook_kw = pd.Series(0.0, index=ghi.index)
+        cook_kw.loc[cook_kw.index.hour.isin([17,18,19])] = 0.6
+
+        Qg_series = (sol_kw + people_kw + cook_kw)           # hourly
+        Qg_series = Qg_series.reindex(idx).interpolate().bfill().ffill()
+
+        # Dynamic room setpoint (simple weather-compensation)
+        tout_minute = sim["tout"] if "sim" in locals() and sim else tout_minute  # keep your existing
+        Tset_series = pd.Series(21.0, index=idx) - 0.12 * (tout_minute - 5.0).clip(lower=0)
+        Tset_series = Tset_series.clip(lower=19.0, upper=21.0)  # don’t drop too much
+
+        # Wind for UA scaling (if you have it)
+        if (weather_hr is not None) and (not weather_hr.empty) and ("wind" in weather_hr):
+            wind_series = weather_hr["wind"].reindex(idx).interpolate().bfill().ffill()
+        else:
+            wind_series = pd.Series(0.0, index=idx)
+
+        # Optional DHW/defrost spikes (example: two short windows today)
+        day0 = pd.Timestamp(idx[0]).normalize()
+        dhw_windows = [
+            (day0 + pd.Timedelta(hours=3, minutes=55), day0 + pd.Timedelta(hours=4, minutes=12)),
+            (day0 + pd.Timedelta(hours=13, minutes=5), day0 + pd.Timedelta(hours=13, minutes=22)),
+        ]
+
+        # --- Instantiate the heat pump with UI + dynamic series ---
         hp = WeatherHP(
+            name="heat_pump_weather",
             ua_kw_per_c=float(st.session_state["hp_ua"]),
             t_set_c=float(st.session_state["hp_tset"]),
+            C_th_kwh_per_c=float(st.session_state.get("hp_Cth", 0.25)),
             q_rated_kw=float(st.session_state["hp_qr"]),
             cop_at_7c=float(st.session_state["hp_cop7"]),
             cop_a=float(st.session_state["hp_copa"]) if st.session_state.get("hp_adv_on") else None,
@@ -439,17 +476,27 @@ def compute_load_env(day, step_min, objective, weather_hr, use_baseload, use_lig
             cop_max=float(st.session_state.get("hp_copmax", 4.2)),
             defrost=bool(st.session_state.get("hp_def", True)),
 
-            # new physical-cycle knobs
-            hyst_band_c=float(st.session_state["hp_hyst"]),
-            C_th_kwh_per_c=float(st.session_state["hp_Cth"]),
+            # thermostat & guards
+            hyst_band_c=float(st.session_state.get("hp_hyst", 0.8)),
+            min_on_min=int(st.session_state.get("hp_min_on", 4)),
+            min_off_min=int(st.session_state.get("hp_min_off", 10)),
+            p_off_kw=float(st.session_state.get("hp_poff", 0.05)),
+
+            # time-varying inputs
+            tset_series_c=Tset_series,
+            internal_gains_kw=Qg_series,
+            wind_ms=wind_series,
+            ua_wind_factor=0.03,
+
+            # initial state + optional DHW spikes (comment out if not wanted)
             Ti0_c=float(st.session_state["hp_tset"]),
-            p_off_kw=float(st.session_state["hp_poff"]),
-            min_on_min=int(st.session_state["hp_min_on"]),
-            min_off_min=int(st.session_state["hp_min_off"]),
+            dhw_windows=dhw_windows,
+            dhw_boost_factor=1.45,
+            dhw_ignore_thermostat=True,
         )
-        load_parts.append(hp.series_kw(idx, tout_minute))
 
-
+        hp_series = hp.series_kw(idx, tout_minute)
+        load_parts.append(hp_series)
 
 
     else:
@@ -1278,11 +1325,12 @@ if use_hp:
             defrost= st.checkbox("Defrost penalty below 3 °C", value=True, key="hp_def")
 
         with st.expander("Thermostat & building dynamics"):
-            hyst_band_c = st.number_input("Thermostat hysteresis (°C)", 0.1, 2.0, 0.6, 0.1, key="hp_hyst")
-            C_th        = st.number_input("Thermal mass C (kWh/°C)",     0.02, 10.0, 0.12, 0.02, key="hp_Cth")
-            p_off_kw    = st.number_input("Standby power when OFF (kW)", 0.00, 0.20, 0.05, 0.01, key="hp_poff")
-            min_on      = st.number_input("Min ON time (min)",           0, 30, 2, 1, key="hp_min_on")
-            min_off     = st.number_input("Min OFF time (min)",          0, 30, 3, 1, key="hp_min_off")
+            st.number_input("Thermostat hysteresis (°C)", 0.2, 2.0, 0.8, 0.1, key="hp_hyst")
+            st.number_input("Thermal mass C (kWh/°C)",     0.05, 5.0, 0.25, 0.05, key="hp_Cth")
+            st.number_input("Standby power OFF (kW)",      0.00, 0.20, 0.05, 0.01, key="hp_poff")
+            st.number_input("Min ON (min)",                0, 30, 4, 1, key="hp_min_on")
+            st.number_input("Min OFF (min)",               0, 60, 10, 1, key="hp_min_off")
+
 
 
 
