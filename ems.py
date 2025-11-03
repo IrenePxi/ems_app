@@ -93,10 +93,10 @@ def _expand_plan_to_series(
 
 # -- series-based engine (very close to what you wrote) -----------------------
 def _rule_power_share_series(
-    load_kw: pd.Series,                # +kW
-    pv_kw: pd.Series,                  # +kW
-    soc_target_pct: pd.Series | float, # SOC target (%) per step or scalar
-    grid_charge_flag: pd.Series | int, # 0/1 per step or scalar
+    load_kw: pd.Series,
+    pv_kw: pd.Series,
+    soc_target_pct: pd.Series | float,
+    grid_charge_flag: pd.Series | int,
     cap_kwh: float,
     p_charge_max_kw: float,
     soc0_kwh: float,
@@ -104,7 +104,11 @@ def _rule_power_share_series(
     eta_ch: float = 0.95,
     eta_dis: float = 0.95,
     p_fc_kw: float | pd.Series = 0.0,
+    # --- NEW anti-chatter knobs ---
+    soc_deadband_pct: float = 2.0,   # ±2% band around target
+    p_eps_kw: float = 0.1,           # powers smaller than this → 0
 ):
+
     idx = load_kw.index
     assert pv_kw.index.equals(idx), "pv_kw index must match load_kw"
 
@@ -118,6 +122,8 @@ def _rule_power_share_series(
 
     # time step
     dt_h = (idx[1] - idx[0]).total_seconds() / 3600.0 if len(idx) > 1 else 1/60.0
+    float_lock = False
+
 
     grid = np.zeros(len(idx))
     pbat = np.zeros(len(idx))      # +discharge to load, -charge from grid/PV
@@ -236,6 +242,30 @@ def _rule_power_share_series(
                 if SOCpct >= 100.0:
                     Pgrid = 0.0
                     Pbatt = 0.0
+                # ------------------ ANTI-CHATTER AROUND SOC TARGET ------------------
+        # define band around target
+        band_lo = max(0.0, SOClvl - soc_deadband_pct)
+        band_hi = min(100.0, SOClvl + soc_deadband_pct)
+
+        # enter / leave "float" (no discharge) region with hysteresis
+        # enter when we reach target; exit only if SOC drops below band_lo
+        if not float_lock and SOCpct >= SOClvl:
+            float_lock = True
+        elif float_lock and SOCpct < band_lo:
+            float_lock = False
+
+        # if floating, block discharge (positive Pbatt)
+        if float_lock and Pbatt > 0.0:
+            Pbatt = 0.0
+
+        # optional: if above band_hi already, block charging too
+        if SOCpct >= band_hi and Pbatt < 0.0:
+            Pbatt = 0.0
+
+        # snap tiny powers to zero
+        if abs(Pbatt) < p_eps_kw:
+            Pbatt = 0.0
+        # -------------------------------------------------------------------
 
         # enforce battery constraints
         Pbatt = clamp_charge_discharge(Pbatt, soc_kwh)
