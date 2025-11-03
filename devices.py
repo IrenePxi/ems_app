@@ -291,6 +291,18 @@ class WeatherHP:
 
         hp_on = Ti[0] < low
 
+        # just before the loop in WeatherHP.series_kw(...)
+        # Build a small daytime internal-gains profile (0.2 kW at night → 0.4 kW mid-day)
+        hours = pd.Index(idx).hour.values if isinstance(idx, pd.DatetimeIndex) else np.zeros(n)
+        G = 0.2 + 0.2 * ( (hours >= 9) & (hours <= 20) ).astype(float)  # 0.4 kW from 09–20
+        # then in the loop, replace self.internal_gains_kw with G[k]
+        Q_hp = self.q_rated_kw if hp_on else 0.0
+        P[k]  = (Q_hp / cop[k]) if hp_on else self.p_off_kw
+        heat_loss = self.ua_kw_per_c * (Ti[k-1] - T_out[k])
+        dTi = (Q_hp + G[k] - heat_loss) / max(self.C_th_kwh_per_c, 1e-6) * dt_h
+        Ti[k] = Ti[k-1] + dTi
+
+
         # step through time
         for k in range(1, n):
             # thermostat with optional min-on/off guard

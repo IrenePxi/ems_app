@@ -429,24 +429,19 @@ def compute_load_env(day, step_min, objective, weather_hr, use_baseload, use_lig
             tout = pd.Series(0.0, index=idx, name="Tout_C")
 
         hp = WeatherHP(
-            ua_kw_per_c=float(st.session_state["hp_ua"]),
-            t_set_c=float(st.session_state["hp_tset"]),
-            q_rated_kw=float(st.session_state["hp_qr"]),
-            cop_at_7c=float(st.session_state["hp_cop7"]),
-            cop_a=float(st.session_state["hp_copa"]) if st.session_state.get("hp_adv_on") else None,
-            cop_b=float(st.session_state["hp_copb"]) if st.session_state.get("hp_adv_on") else None,
-            cop_min=float(st.session_state.get("hp_copmin", 1.6)),
-            cop_max=float(st.session_state.get("hp_copmax", 4.2)),
-            defrost=bool(st.session_state.get("hp_def", True)),
-
-            # new physical-cycle knobs
-            hyst_band_c=float(st.session_state["hp_hyst"]),
-            C_th_kwh_per_c=float(st.session_state["hp_Cth"]),
-            Ti0_c=float(st.session_state["hp_tset"]),
-            p_off_kw=float(st.session_state["hp_poff"]),
-            min_on_min=int(st.session_state["hp_min_on"]),
-            min_off_min=int(st.session_state["hp_min_off"]),
+            ua_kw_per_c=0.14,
+            t_set_c=21.0,
+            q_rated_kw=8.0,          # gives ~2.4 kW electric at 10°C (COP ~3.35)
+            cop_at_7c=3.2,
+            cop_min=1.6, cop_max=4.2,
+            C_th_kwh_per_c=0.75,
+            hyst_band_c=0.6,
+            p_off_kw=0.05,           # 50 W standby
+            defrost=True,
+            min_on_min=0,            # not needed to force the cycle; physics makes it
+            min_off_min=0
         )
+
         load_parts.append(hp.series_kw(idx, tout_minute))
 
 
@@ -1264,9 +1259,9 @@ if use_hp:
     with st.expander("Heat pump settings", expanded=True):
         st.caption("Outdoor temperature is fetched automatically from Open-Meteo for the selected day.")
 
-        ua    = st.number_input("House loss UA (kW/°C)", 0.05, 2.0, 0.25, 0.05, key="hp_ua")
+        ua    = st.number_input("House loss UA (kW/°C)", 0.05, 2.0, 0.14, 0.05, key="hp_ua")
         tset  = st.number_input("Indoor setpoint (°C)",   10.0, 26.0, 21.0, 0.5,  key="hp_tset")
-        qrat  = st.number_input("Rated heat capacity (kW)", 1.0, 25.0, 5.0, 0.5,  key="hp_qr")
+        qrat  = st.number_input("Rated heat capacity (kW)", 1.0, 25.0, 8.0, 0.5,  key="hp_qr")
         cop7  = st.number_input("COP at 7 °C",             1.0, 8.0,  3.2, 0.1,  key="hp_cop7")
 
         with st.expander("Advanced COP & defrost (optional)"):
@@ -1279,7 +1274,7 @@ if use_hp:
 
         with st.expander("Thermostat & building dynamics"):
             hyst_band_c = st.number_input("Thermostat hysteresis (°C)", 0.1, 2.0, 0.6, 0.1, key="hp_hyst")
-            C_th        = st.number_input("Thermal mass C (kWh/°C)",     0.02, 10.0, 0.12, 0.02, key="hp_Cth")
+            C_th        = st.number_input("Thermal mass C (kWh/°C)",     0.02, 10.0, 0.75, 0.02, key="hp_Cth")
             p_off_kw    = st.number_input("Standby power when OFF (kW)", 0.00, 0.20, 0.05, 0.01, key="hp_poff")
             min_on      = st.number_input("Min ON time (min)",           0, 30, 2, 1, key="hp_min_on")
             min_off     = st.number_input("Min OFF time (min)",          0, 30, 3, 1, key="hp_min_off")
