@@ -133,7 +133,7 @@ def mpc_opt_single(df_slots, SOC0, SOC_min, SOC_max, Pbat_chargemax=9, Qbat=75):
 
     A_grid_1 = A_step.copy()
     A_grid_2 = -np.eye(N)
-    A_grid   = np.hstack([A_grid_1, A_grid_2]) / 100.0 * Qbat
+    A_grid   = np.hstack([A_grid_1/ 100.0 * Qbat, A_grid_2]) 
 
     A = np.vstack([A_soc_pos, A_soc_neg, A_grid])
 

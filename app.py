@@ -34,6 +34,7 @@ This app lets you explore your household daily energy behavior. You can:
 - Try different battery or inverter setups, and get smart suggestions from the EMS on when and how to use or store energy.
 """)
 
+
 #----------------------------------------------------------------------------------------------------
 # --- at the top, after imports ---
 if "sim" not in st.session_state:  # stores load/env results
@@ -54,66 +55,83 @@ def note(name, start_idx, duration_min, idx):
 
 
 # --- helper functions you already have (sketch) ---
-def compute_simulation(day, step_min, controls) -> dict:
-    # build idx, load_parts, load, pv, price, co2, tout_minute, notes, parts_df, etc.
-    # DO NOT plot here—just return data needed to plot later
-    return {
-        "idx": idx,
-        "dt_h": dt_h,
-        "load": load,
-        "pv": pv,
-        "price": price,
-        "co2": co2,
-        "tout": tout_minute,
-        "parts_df": parts_df,
-        "notes": {"temp": note_temp, "price": note_price, "co2": note_co2},
-    }
+def init_demo_state():
+    ss = st.session_state
+    # weights & geo
+    ss.setdefault("w", (0.60, 0.25, 0.15))
+    ss.setdefault("geo_lat", 55.6761)
+    ss.setdefault("geo_lon", 12.5683)
 
-def render_sim(sim):
-    idx, load, pv = sim["idx"], sim["load"], sim["pv"]
-    # Load & PV
-    fig_lpg = go.Figure()
-    fig_lpg.add_scatter(x=idx, y=load, name="Load (kW)", mode="lines")
-    fig_lpg.add_scatter(x=idx, y=pv,   name="PV (kW)",   mode="lines")
-    fig_lpg.update_layout(_ts_layout("Load vs PV"))
-    st.plotly_chart(fig_lpg, use_container_width=True, key="sim_load_pv")
+    # baseload defaults
+    ss.setdefault("base_router", 12.0)
+    ss.setdefault("base_vent",   40.0)
+    ss.setdefault("base_standby",60.0)
+    ss.setdefault("base_dhw",     0.0)
+    ss.setdefault("base_fridge", 45.0)
+    ss.setdefault("base_o1",      0.0)
+    ss.setdefault("base_o2",      0.0)
 
-    # Per-device
-    parts_df = sim["parts_df"]
-    if parts_df is not None and not parts_df.empty:
-        fig_parts = go.Figure()
-        for c in parts_df.columns:
-            fig_parts.add_scatter(x=parts_df.index, y=parts_df[c], name=c, mode="lines")
-        fig_parts.update_layout(_ts_layout("Per-device power"))
-        st.plotly_chart(fig_parts, use_container_width=True, key="sim_parts")
+    # lights
+    ss.setdefault("lights_count", 5)
+    ss.setdefault("lights_power", 12)
+    ss.setdefault("lights_start", time(18,0))
+    ss.setdefault("lights_end",   time(23,30))
 
-    # Environment
-    fig_temp = go.Figure()
-    fig_temp.add_scatter(x=idx, y=sim["tout"], name="Outdoor Temp (°C)", mode="lines")
-    fig_temp.update_layout(_ts_layout("Outdoor Temperature", ytitle="°C"))
-    st.plotly_chart(fig_temp, use_container_width=True, key="sim_temp")
+    # range hood
+    ss.setdefault("hood_p", 150.0)
+    ss.setdefault("hood_lunch_on", True)
+    ss.setdefault("hood_dinner_on", True)
+    ss.setdefault("hood_ls", time(12,30))
+    ss.setdefault("hood_ld", 20)
+    ss.setdefault("hood_ds", time(18,0))
+    ss.setdefault("hood_dd", 30)
 
-    fig_price = go.Figure()
-    fig_price.add_scatter(x=idx, y=sim["price"], name="Price (DKK/kWh)", mode="lines")
-    fig_price.update_layout(_ts_layout("Electricity Price", ytitle="DKK/kWh"))
-    st.plotly_chart(fig_price, use_container_width=True, key="sim_price")
+    # washing machine
+    ss.setdefault("wm_p", 1200.0)
+    ss.setdefault("wm_dur", 90)
+    ss.setdefault("wm_ws", time(8,0))
+    ss.setdefault("wm_we", time(22,0))
+    ss.setdefault("wm_sched", "Auto (optimize)")
+    ss.setdefault("wm_manual", time(9,0))
 
-    fig_co2 = go.Figure()
-    fig_co2.add_scatter(x=idx, y=sim["co2"], name="CO₂ (g/kWh)", mode="lines")
-    fig_co2.update_layout(_ts_layout("CO₂ Intensity", ytitle="gCO₂/kWh"))
-    st.plotly_chart(fig_co2, use_container_width=True, key="sim_co2")
+    # dishwasher
+    ss.setdefault("dw_p", 1500.0)
+    ss.setdefault("dw_dur", 90)
+    ss.setdefault("dw_ws", time(19,0))
+    ss.setdefault("dw_we", time(7,0))
+    ss.setdefault("dw_sched", "Auto (optimize)")
+    ss.setdefault("dw_manual", time(20,30))
 
-def run_ems_on_sim(sim, plan_df_or_mode) -> dict:
-    # If manual plan: build per-minute targets → call rule_power_share(...)
-    # If auto plan: make hourly df → slots → optimizer → plan_df → rule_power_share(...)
-    grid, pbat, pv_used, soc = rule_power_share(
-        load_kw=sim["load"], pv_kw=sim["pv"],
-        soc_target_pct=soc_series, grid_charge_flag=gc_series,
-        cap_kwh=cap_kwh, p_charge_max_kw=p_kw,
-        soc0_kwh=soc0_kwh, energy_pattern=energy_pattern,
-        eta_ch=0.95, eta_dis=0.95
-    )
-    return {"grid": grid, "pbat": pbat, "pv_used": pv_used, "soc": soc}
+    # dryer
+    ss.setdefault("dr_p", 1000.0)
+    ss.setdefault("dr_dur", 90)
+    ss.setdefault("dr_ws", time(8,0))
+    ss.setdefault("dr_we", time(22,0))
+    ss.setdefault("dr_sched", "Auto (optimize)")
+    ss.setdefault("dr_manual", time(21,0))
+
+    # EV
+    ss.setdefault("ev_p", 11.0)
+    ss.setdefault("ev_e", 50.0)
+    ss.setdefault("ev_ws", time(1,0))
+    ss.setdefault("ev_we", time(6,0))
+    ss.setdefault("ev_sched", "Auto (optimize)")
+    ss.setdefault("ev_manual", time(1,0))
+
+    # PV parameters
+    ss.setdefault("pv_tilt", 30.0)
+    ss.setdefault("pv_az",   180.0)
+    ss.setdefault("pv_loss", 0.14)
+
+    # battery
+    ss.setdefault("batt_cap", 75.0)
+    ss.setdefault("batt_pow", 9.0)
+    ss.setdefault("batt_soc_pct", 20.0)
+    ss.setdefault("soc_min_pct", 15.0)
+
+    # misc
+    ss.setdefault("scheduled_notes", [])
+
 
 def render_ems(sim, ems):
     idx = sim["idx"]
@@ -299,7 +317,24 @@ def pv_from_weather_modelchain_from_df(
 
 
 # -------- Helpers ---------------------------------------------------------
-def compute_load_env(day, step_min, objective, weather_hr, use_baseload, use_lights, use_hood,
+def _norm01(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    lo, hi = float(np.nanmin(s.values)), float(np.nanmax(s.values))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi - lo < 1e-12:
+        # flat if constant/missing
+        return pd.Series(0.5, index=s.index, dtype=float)
+    out = (s - lo) / (hi - lo)
+    return out.reindex(s.index).interpolate().bfill().ffill().astype(float)
+
+def device_weights_from_W(W: tuple[float,float,float]) -> tuple[float,float]:
+    """Take (w_cost, w_co2, w_comfort) → renormalize to two weights for device scheduling."""
+    wc, w2, _ = map(float, W)
+    s = wc + w2
+    if s < 1e-9:      # both zero? fall back to cost-only
+        return 1.0, 0.0
+    return wc/s, w2/s
+
+def compute_load_env(day, step_min, weather_hr, use_baseload, use_lights, use_hood,
                      use_wm, use_dw, use_dryer, use_ev, use_hp, pv_kwp, idx_preview):
     """Build idx, load components, total load, PV, price, CO2, Tout, etc. No EMS here."""
     idx = minute_index(day, step_min=step_min)
@@ -308,7 +343,23 @@ def compute_load_env(day, step_min, objective, weather_hr, use_baseload, use_lig
     # signals
     price_plot, price_hourly, note_price = daily_price_dual(idx, day, area="DK1")
     co2,   note_co2   = daily_co2_with_note(idx, day, area="DK1")
-    signal = price_hourly if objective == "cost" else (co2 if objective == "co2" else price_hourly*0.0)
+    # ---- device scheduling signal (price ⊕ CO2) ----
+    w_cost3, w_co23, _ = st.session_state.get("w", (0.60, 0.25, 0.15))
+    w_cost_dev, w_co2_dev = device_weights_from_W((w_cost3, w_co23, 0.0))
+
+    # minute-level price & CO2 (aligned to idx)
+    price_min = align_daily_series(idx, price_hourly)  # price_hourly is hourly; we upsample
+    co2_min   = align_daily_series(idx, co2)
+
+    price_n = _norm01(price_min)
+    co2_n   = _norm01(co2_min)
+
+    signal = (w_cost_dev * price_n + w_co2_dev * co2_n).rename("device_objective")
+
+    # If the user set both weights ~0 (safety), default to price
+    if (w_cost_dev == 0.0 and w_co2_dev == 0.0) or signal.isna().all():
+        signal = _norm01(price_min)
+
 
     # temperature
     tout_minute, note_temp = daily_temperature_with_note(idx, weather_hr)
@@ -492,16 +543,21 @@ def show_load_env(sim):
     if notes.get("temp"): st.caption(f"ℹ️ {notes['temp']}")
 
     fig_co2 = go.Figure()
-    fig_co2.add_scatter(x=co2.index, y=co2.values, name="CO₂ (g/kWh)", mode="lines")
-    fig_co2.update_layout(_ts_layout("CO₂ Intensity", ytitle="gCO₂/kWh", height=260))
+    fig_co2.add_bar(x=co2.index, y=co2.values, name="CO₂ (g/kWh)")
+    fig_co2.update_layout(_ts_layout("CO₂ Intensity", ytitle="gCO₂/kWh"))
+    fig_co2.update_layout(bargap=0.10, bargroupgap=0.00)
     st.plotly_chart(fig_co2, use_container_width=True)
     if notes.get("co2"): st.caption(f"ℹ️ {notes['co2']}")
 
+
     fig_price = go.Figure()
-    fig_price.add_scatter(x=price.index, y=price, name="Price (DKK/kWh)", mode="lines")
-    fig_price.update_layout(_ts_layout("Electricity Price", ytitle="DKK/kWh", height=260))
+    fig_price.add_bar(x=price.index, y=price, name="Price (DKK/kWh)")
+    fig_price.update_layout(_ts_layout("Electricity Price", ytitle="DKK/kWh"))
+    fig_price.update_layout(bargap=0.10, bargroupgap=0.00)
     st.plotly_chart(fig_price, use_container_width=True)
-    if notes.get("price"): st.caption(f"ℹ️ {notes['price']}")
+    if notes.get("price"):
+        st.caption(f"ℹ️ {notes['price']}")
+
 
 def ems_power_split_plot(idx, load, pv, grid_import, pbat):
     """Stack-like view for EMS split."""
@@ -563,15 +619,15 @@ def _collapse_quarters_to_hourly(s: pd.Series) -> pd.Series:
     s = s.copy()
     s.index = pd.to_datetime(s.index, errors="coerce")
     s = s[~s.index.isna()].sort_index()
-    # If quarter-hourly, take mean per hour; if hourly already, just floor
-    minutes = s.index.minute
-    is_q = set(minutes.unique()).issubset({0, 15, 30, 45}) and len(minutes.unique()) > 1
-    s = s.groupby(s.index.floor("H")).mean() if is_q else s.set_axis(s.index.floor("H"))
+
+    # normalize tz BEFORE any flooring/grouping
     if getattr(s.index, "tz", None) is not None:
-        s.index = s.index.tz_localize(None)
-    s = s[~s.index.duplicated(keep="first")].sort_index()
-    s.name = s.name or "price_dkk_per_kwh"
-    return s
+        s.index = s.index.tz_convert("Europe/Copenhagen").tz_localize(None)
+
+    hourly = s.groupby(s.index.floor("h")).mean()   # robust for 15-min or hourly
+    hourly.name = s.name or "price_dkk_per_kwh"
+    return hourly
+
 
 
 def _clean_hourly_index(s: pd.Series) -> pd.Series:
@@ -790,6 +846,26 @@ def _fetch_dayahead_prices_latest(area: str = "DK1") -> pd.DataFrame:
 
     return df.set_index("HourDK")[["price_dkk_per_kwh"]]
 
+def step_hold_to_minutes(s_native, idx_min):
+    s = s_native.copy()
+    s.index = pd.to_datetime(s.index, errors="coerce")
+    s = s[~s.index.isna()]
+    if getattr(s.index, "tz", None) is not None:
+        s.index = s.index.tz_localize(None)
+
+    # Slice to the day window (optional but tidy)
+    start, end = idx_min[0], idx_min[-1]
+    s = s[(s.index >= start) & (s.index <= end)]
+
+    # Direct step-hold upsample to minutes
+    s_min = (
+        s.reindex(idx_min)   # put values on the exact minute grid
+         .ffill()            # hold-forward within each 15-min bin and past the last stamp
+         .bfill()            # fill the first few minutes before the first stamp, if any
+         .astype(float)
+    )
+    return s_min.rename("price_dkk_per_kwh")
+
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -841,7 +917,8 @@ def daily_price_dual(idx_min: pd.DatetimeIndex, day: date, area="DK1"):
         return price_plot, price_hourly, note
 
     # Build plotting series at native resolution → align to minute index for display only
-    price_plot = s_native.reindex(idx_min).interpolate().bfill().ffill().rename("price_dkk_per_kwh")
+    price_plot = step_hold_to_minutes(s_native, idx_min)
+
 
     # Build hourly series for EMS
     s_hourly = _collapse_quarters_to_hourly(s_native)
@@ -899,39 +976,40 @@ def fetch_co2_for_day(day: date, area: str = "DK1") -> pd.Series:
 
 def daily_co2_with_note(idx_min: pd.DatetimeIndex, day: date, area="DK1") -> tuple[pd.Series, str|None]:
     """
-    Returns (co2_series_on_idx_min, note).
-    - Validates completeness on 5-min grid (the API cadence),
-      then upsamples to the app's minute index for plotting.
+    Return minute-level CO₂ (g/kWh) where each 5-min value is held constant
+    through its 5-minute block. Also reports how many 5-min points were missing.
     """
-    # 5-min local-naive series for the calendar day (may contain NaNs at 5-min timestamps)
-    s5 = fetch_co2_for_day(day, area=area).rename("gCO2_per_kWh")  # 288 points
+    # 5-min local-naive CO₂ for the calendar day (may contain NaNs at 5-min stamps)
+    s5 = fetch_co2_for_day(day, area=area).rename("gCO2_per_kWh")  # expected 288 rows
 
-    # Build the exact 5-min grid that covers the selected minute range
-    start5 = idx_min[0]
-    end5   = idx_min[-1]
-    idx5   = pd.date_range(start=start5, end=end5, freq="5min")
+    # Build a 5-min grid that covers the minute range
+    start5 = idx_min[0].floor("5min")
+    end5   = idx_min[-1].ceil("5min")
+    idx5   = pd.date_range(start=start5, end=end5, freq="5min", inclusive="left")
 
-    # Align to 5-min grid and count only *real* API gaps on that grid
+
+    # Align to the 5-min grid
     s5_aligned = s5.reindex(idx5)
     miss5 = int(s5_aligned.isna().sum())
     note = None
 
     if s5_aligned.isna().all():
-        # No API data at all → synthesize (then upsample)
+        # No API data at all → synthesize (then step-hold)
         hrs = (idx_min - idx_min[0]).total_seconds() / 3600.0
-        placeholder = 250.0 + 100.0*np.sin(2*np.pi*(hrs - 15.0)/24.0)  # g/kWh placeholder
-        s_min = pd.Series(placeholder, index=idx_min, name="gCO2_per_kWh")
+        s_min = pd.Series(250.0 + 100.0*np.sin(2*np.pi*(hrs - 15.0)/24.0),
+                          index=idx_min, name="gCO2_per_kWh")
         note = "No CO₂ data from EnergiDataService for this day. Showing a smooth placeholder curve."
         return s_min, note
 
-    # Fill only the 5-min gaps
+    # Fill only the missing *5-min* stamps (no interpolation within blocks)
     if miss5 > 0:
-        s5_aligned = s5_aligned.interpolate(limit_direction="both").bfill().ffill()
-        note = f"Filled {miss5} missing CO₂ points by interpolation."
+        s5_aligned = s5_aligned.ffill().bfill()
+        note = f"Filled {miss5} missing CO₂ points by forward/backward fill on the 5-min grid."
 
-    # Finally upsample to the app’s minute index for plotting/usage
-    s_min = s5_aligned.reindex(idx_min).interpolate().bfill().ffill().astype(float)
+    # Upsample to minutes with step-hold (constant within each 5-min slot)
+    s_min = s5_aligned.reindex(idx_min).ffill().astype(float)
     return s_min.rename("gCO2_per_kWh"), note
+
 
 
 def daily_temperature_with_note(idx_min: pd.DatetimeIndex, weather_hr: pd.DataFrame) -> tuple[pd.Series, str|None]:
@@ -963,48 +1041,57 @@ with st.sidebar:
     st.header("General")
     day = st.date_input("Day", value=date.today())
     step_min = 1
-    objective = st.selectbox(
-        "Objective", ["cost", "co2", "reservation"], index=0,
-        format_func=lambda s: {"cost": "Minimize cost", "co2": "Minimize CO₂", "reservation": "Energy reservation"}[s]
-    )
-    ems_mode = {"cost": "economic", "reservation": "reserve", "co2": "green"}[objective]
-    
-    # app.py (inside your sidebar, near other controls)
-    slot_mode = st.radio(
-        "Battery slot source",
-        ["Manual (I enter slots & setpoints)", "Auto (Use EMS logic)"],
-        index=1, horizontal=False
-    )
 
-    energy_pattern = st.selectbox(
-        "Rule priority",
-        options=[2, 1],
-        index=0,
-        format_func=lambda x: "Load first (2)" if x==2 else "Battery first (1)"
-    )
-
-    # If Manual: collect 6 slots + setpoints
-    manual_plan_rows = []
-    if slot_mode.startswith("Manual"):
-        st.markdown("**Manual battery plan (6 slots)**")
-        cols = st.columns([1,1,1,1,1,1])
-        st.caption("Enter start/end (HH:MM), SOC setpoint (%), and GridCharge (0/1)")
-        for i in range(6):
-            c1, c2, c3, c4 = st.columns([1,1,1,1])
-            st.markdown(f"**Slot {i+1}**")
-            st_time_start = c1.time_input(f"Start {i+1}", value=time(0,0) if i==0 else time(6,0), key=f"s{i}_s")
-            st_time_end   = c2.time_input(f"End {i+1}",   value=time(6,0) if i==0 else time(23,59) if i==5 else time(10,0), key=f"s{i}_e")
-            st_soc        = c3.number_input(f"SOC% {i+1}", min_value=0.0, max_value=100.0, value=20.0 if i==0 else 50.0, key=f"s{i}_soc")
-            st_grid       = c4.selectbox(f"GridCharge {i+1}", options=[0,1], index=0, key=f"s{i}_gc")
-            manual_plan_rows.append(dict(start=st_time_start, end=st_time_end,
-                                        soc_setpoint_pct=st_soc, grid_charge_allowed=st_grid))
-
-
-
+    # ems_mode = {"cost": "economic", "reservation": "reserve", "co2": "green"}[objective]
+    # --- Multi-objective weights (Cost, CO2, Comfort) ---
 
     st.markdown("**Location**")
     st.number_input("Latitude",  -90.0,  90.0, 55.6761, 0.0001, key="geo_lat")
     st.number_input("Longitude", -180.0, 180.0, 12.5683, 0.0001, key="geo_lon")
+
+    with st.expander("Multi-objective weights (Cost–CO₂–Comfort)", expanded=True):
+        # ---- init raw slider state once ----
+        if "w_raw" not in st.session_state:
+            st.session_state["w_raw"] = [0.60, 0.25, 0.15]  # Cost, CO2, Comfort
+        if "w_cost_slider" not in st.session_state:
+            st.session_state["w_cost_slider"] = st.session_state["w_raw"][0]
+            st.session_state["w_co2_slider"]  = st.session_state["w_raw"][1]
+            st.session_state["w_cmf_slider"]  = st.session_state["w_raw"][2]
+
+        # ---- presets set RAW + push slider positions (do NOT normalize here) ----
+        st.markdown("**Presets:**")
+        if st.button("Cost-first", key="w_p_cost"):
+            st.session_state["w_raw"] = [1.0, 0.0, 0.0]
+            st.session_state["w_cost_slider"], st.session_state["w_co2_slider"], st.session_state["w_cmf_slider"] = st.session_state["w_raw"]
+
+        if st.button("CO₂-first", key="w_p_co2"):
+            st.session_state["w_raw"] = [0.0, 1.0, 0.0]
+            st.session_state["w_cost_slider"], st.session_state["w_co2_slider"], st.session_state["w_cmf_slider"] = st.session_state["w_raw"]
+
+        if st.button("Comfort-first", key="w_p_cmf"):
+            st.session_state["w_raw"] = [0.0, 0.0, 1.0]
+            st.session_state["w_cost_slider"], st.session_state["w_co2_slider"], st.session_state["w_cmf_slider"] = st.session_state["w_raw"]
+
+        if st.button("⚖️ Balanced", key="w_p_bal"):
+            st.session_state["w_raw"] = [1/3, 1/3, 1/3]
+            st.session_state["w_cost_slider"], st.session_state["w_co2_slider"], st.session_state["w_cmf_slider"] = st.session_state["w_raw"]
+
+        # ---- sliders show RAW and update RAW only ----
+        w_cost = st.slider("Cost weight",    0.0, 1.0, float(st.session_state["w_cost_slider"]), 0.01, key="w_cost_slider")
+        w_co2  = st.slider("CO₂ weight",     0.0, 1.0, float(st.session_state["w_co2_slider"]),  0.01, key="w_co2_slider")
+        w_cmf  = st.slider("Comfort weight", 0.0, 1.0, float(st.session_state["w_cmf_slider"]),  0.01, key="w_cmf_slider")
+
+        # persist raw (exactly what bars show)
+        st.session_state["w_raw"] = [w_cost, w_co2, w_cmf]
+
+        # ---- compute normalized for display/logic, but DON'T push back to sliders ----
+        s = max(w_cost + w_co2 + w_cmf, 1e-9)
+        W = (w_cost/s, w_co2/s, w_cmf/s)   # normalized
+        st.session_state["w"] = W          # downstream uses this
+        st.caption(f"Using normalized weights → Cost={W[0]:.2f}, CO₂={W[1]:.2f}, Comfort={W[2]:.2f}")
+
+
+
 
 # --- Preview index & helpers (for the badges) ---
 idx_preview = minute_index(day, step_min=step_min)
@@ -1012,7 +1099,16 @@ dt_h = step_min/60.0
 # Preview signals (no uploads; use defaults)
 price_prev = default_price_profile(idx_preview)
 co2_prev   = default_co2_profile(idx_preview)
-signal_preview = price_prev if objective == "cost" else (co2_prev if objective == "co2" else price_prev*0.0)
+# --- preview uses the *same* blended device signal as the real run ---
+price_prev = default_price_profile(idx_preview)
+co2_prev   = default_co2_profile(idx_preview)
+wc, w2, _ = st.session_state.get("w", (0.60, 0.25, 0.15))
+w_cost_dev, w_co2_dev = device_weights_from_W((wc, w2, 0.0))
+price_prev_n = _norm01(price_prev)
+co2_prev_n   = _norm01(co2_prev)
+signal_preview = (w_cost_dev * price_prev_n + w_co2_dev * co2_prev_n).rename("device_objective_preview")
+if (w_cost_dev == 0.0 and w_co2_dev == 0.0) or signal_preview.isna().all():
+    signal_preview = price_prev_n  # safety fallback
 
 
 
@@ -1256,7 +1352,7 @@ st.markdown("## 2. 🌡️ Thermal Loads")
 
 use_hp = st.checkbox("Heat pump", value=True, key="hp_on")
 if use_hp:
-    with st.expander("Heat pump settings", expanded=True):
+    with st.expander("Heat pump settings", expanded=False):
         st.caption("Outdoor temperature is fetched automatically from Open-Meteo for the selected day.")
 
         ua    = st.number_input("House loss UA (kW/°C)", 0.05, 2.0, 0.14, 0.05, key="hp_ua")
@@ -1286,15 +1382,15 @@ if use_hp:
 st.markdown("---")
 st.markdown("## 3. Installed Power Generation & Storage")
 
-g1, g2 = st.columns(2)
 # --- PV sizing UI (drop this where you define pv_kwp) ---
-with g1:
-    use_pv= st.checkbox("Enable PV", value=True, key="pv_on")
-    module_wp = st.number_input("Module nameplate (Wp)", min_value=50, value=400, step=10, disabled=not use_pv,key="pv_mod_wp")
-    n_panels  = st.number_input("Number of panels", min_value=0, value=16, step=1, disabled=not use_pv,key="pv_n")
-    pv_kwp = (module_wp * n_panels) / 1000.0
-    st.caption(f"Total DC size: **{pv_kwp:.2f} kWp**")
-    if use_pv:
+use_pv= st.checkbox("Enable PV", value=True, key="pv_on")
+
+if use_pv:
+    with st.expander("PV settings", expanded=False):
+        module_wp = st.number_input("Module nameplate (Wp)", min_value=50, value=400, step=10, disabled=not use_pv,key="pv_mod_wp")
+        n_panels  = st.number_input("Number of panels", min_value=0, value=16, step=1, disabled=not use_pv,key="pv_n")
+        pv_kwp = (module_wp * n_panels) / 1000.0
+        st.caption(f"Total DC size: **{pv_kwp:.2f} kWp**")
         with st.expander("PV orientation & losses"):
             # angle from horizontal
             st.number_input("Tilt (°)", min_value=0.0, max_value=90.0, value=30.0, step=1.0, disabled=not use_pv, key="pv_tilt")
@@ -1305,12 +1401,45 @@ with g1:
 
 
 
+use_batt = st.checkbox("Enable battery", value=True, key="batt_on")
 
-with g2:
-    use_batt = st.checkbox("Enable battery", value=True, key="batt_on")
-    cap_kwh = st.number_input("Battery capacity (kWh)", 0.0, 100.0, 75.0, 0.5, disabled=not use_batt, key="batt_cap")
-    p_kw    = st.number_input("Battery power (kW)",      0.0, 50.0,  9.0, 0.5, disabled=not use_batt, key="batt_pow")
-    soc_pct = st.number_input("Initial SOC (%)",         0.0, 100.0, 20.0, 1.0, disabled=not use_batt, key="batt_soc_pct")
+if use_batt:
+    with st.expander("Battery settings", expanded=False):
+        cap_kwh = st.number_input("Battery capacity (kWh)", 0.0, 100.0, 75.0, 0.5, disabled=not use_batt, key="batt_cap")
+        p_kw    = st.number_input("Battery power (kW)",      0.0, 50.0,  9.0, 0.5, disabled=not use_batt, key="batt_pow")
+        soc_pct = st.number_input("Initial SOC (%)",         0.0, 100.0, 20.0, 1.0, disabled=not use_batt, key="batt_soc_pct")
+        soc_min_pct = st.number_input("Battery SOC_min (%)", 0.0, 100.0, 15.0, 1.0,disabled=not use_batt,  key="soc_min_pct")
+        with st.expander("Battery Control Mode"):
+            slot_mode = st.radio(
+                "Battery slot source",
+                ["Manual (I enter slots & setpoints)", "Auto (Use EMS logic)"],
+                index=1, horizontal=False
+            )
+            # If Manual: collect 6 slots + setpoints
+            manual_plan_rows = []
+            if slot_mode.startswith("Manual"):
+                st.markdown("**Manual battery plan (6 slots)**")
+                cols = st.columns([1,1,1,1,1,1])
+                st.caption("Enter start/end (HH:MM), SOC setpoint (%), and GridCharge (0/1)")
+                for i in range(6):
+                    c1, c2, c3, c4 = st.columns([1,1,1,1])
+                    st.markdown(f"**Slot {i+1}**")
+                    st_time_start = c1.time_input(f"Start {i+1}", value=time(0,0) if i==0 else time(6,0), key=f"s{i}_s")
+                    st_time_end   = c2.time_input(f"End {i+1}",   value=time(6,0) if i==0 else time(23,59) if i==5 else time(10,0), key=f"s{i}_e")
+                    st_soc        = c3.number_input(f"SOC% {i+1}", min_value=0.0, max_value=100.0, value=20.0 if i==0 else 50.0, key=f"s{i}_soc")
+                    st_grid       = c4.selectbox(f"GridCharge {i+1}", options=[0,1], index=0, key=f"s{i}_gc")
+                    manual_plan_rows.append(dict(start=st_time_start, end=st_time_end,
+                                                soc_setpoint_pct=st_soc, grid_charge_allowed=st_grid))
+
+
+            energy_pattern = st.selectbox(
+                "Rule priority",
+                options=[2, 1],
+                index=0,
+                format_func=lambda x: "Load first (2)" if x==2 else "Battery first (1)"
+            )
+        
+
 
 soc0_kwh = (st.session_state["batt_soc_pct"] / 100.0) * st.session_state["batt_cap"] if use_batt else 0.0
 
@@ -1330,7 +1459,7 @@ if st.session_state["scheduled_notes"]:
 if sim_col.button("▶️ Run simulation"):
     st.session_state["scheduled_notes"] = [] 
     sim = compute_load_env(
-        day=day, step_min=step_min, objective=objective, weather_hr=weather_hr,
+        day=day, step_min=step_min, weather_hr=weather_hr,
         use_baseload=use_baseload, use_lights=use_lights, use_hood=use_hood,
         use_wm=use_wm, use_dw=use_dw, use_dryer=use_dryer, use_ev=use_ev, use_hp=use_hp,
         pv_kwp=pv_kwp, idx_preview=idx_preview
@@ -1339,7 +1468,7 @@ if sim_col.button("▶️ Run simulation"):
     st.session_state["ems"] = None         # optional: clear previous EMS
     st.success("Simulation complete (no EMS).")
 
-
+#%%
 
 # ---------- Phase 2: EMS on existing simulation ----------
 ems_disabled = st.session_state.get("sim") is None
@@ -1364,7 +1493,7 @@ if ems_col.button("⚡ Run EMS on current simulation", disabled=ems_disabled):
             time_slots = generate_smart_time_slots(df_hourly)
             df_slots   = assign_data_to_time_slots_single(df_hourly, time_slots)
             SOC0 = float(st.session_state["batt_soc_pct"])
-            SOC_min = 15.0 if objective != "reservation" else 50.0
+            SOC_min = float(st.session_state.get("soc_min_pct", 15.0))   # <- user input
             SOC_max = 100.0
             SOC_opt, Qgrid, _ = mpc_opt_single(
                 df_slots, SOC0=SOC0, SOC_min=SOC_min, SOC_max=SOC_max,
@@ -1485,3 +1614,5 @@ if st.session_state.get("sim") is not None:
 if st.session_state.get("ems") is not None:
     st.header("B) EMS results")
     render_ems(st.session_state["sim"], st.session_state["ems"])  # keys like "ems_split", "ems_soc"
+
+
