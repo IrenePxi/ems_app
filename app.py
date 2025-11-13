@@ -14,7 +14,7 @@ from devices import (
     WashingMachine, Dishwasher, Dryer, RangeHood, EVCharger, WeatherHP
 )
 from ems import rule_power_share
-from Optimization_based import generate_smart_time_slots, assign_data_to_time_slots_single, mpc_opt_single, format_results_single
+from Optimization_based import generate_smart_time_slots, assign_data_to_time_slots_single, mpc_opt_single, mpc_opt_multi, format_results_single
 from report import save_csv, save_plots, save_summary_md
 import pvlib
 from pvlib.location import Location
@@ -111,12 +111,12 @@ def init_demo_state():
     ss.setdefault("dr_manual", time(21,0))
 
     # EV
-    ss.setdefault("ev_p", 11.0)
-    ss.setdefault("ev_e", 50.0)
+    ss.setdefault("ev_cap_kwh", 75.0)
+    ss.setdefault("ev_power_kw", 11.0)
     ss.setdefault("ev_ws", time(1,0))
     ss.setdefault("ev_we", time(6,0))
-    ss.setdefault("ev_sched", "Auto (optimize)")
-    ss.setdefault("ev_manual", time(1,0))
+    ss.setdefault("ev_arrival_soc_pct", 20.0)
+    ss.setdefault("ev_depart_min_soc_pct", 40.0)
 
     # PV parameters
     ss.setdefault("pv_tilt", 30.0)
@@ -132,7 +132,7 @@ def init_demo_state():
     # misc
     ss.setdefault("scheduled_notes", [])
 
-
+#%%
 def render_ems(sim, ems):
     idx = sim["idx"]
     load, pv = sim["load"], sim["pv"]
@@ -347,9 +347,8 @@ def compute_load_env(day, step_min, weather_hr, use_baseload, use_lights, use_ho
     w_cost3, w_co23, _ = st.session_state.get("w", (0.60, 0.25, 0.15))
     w_cost_dev, w_co2_dev = device_weights_from_W((w_cost3, w_co23, 0.0))
 
-    # minute-level price & CO2 (aligned to idx)
-    price_min = align_daily_series(idx, price_hourly)  # price_hourly is hourly; we upsample
-    co2_min   = align_daily_series(idx, co2)
+    price_min = price_plot 
+    co2_min   = co2
 
     price_n = _norm01(price_min)
     co2_n   = _norm01(co2_min)
@@ -455,10 +454,11 @@ def compute_load_env(day, step_min, weather_hr, use_baseload, use_lights, use_ho
             load_parts.append(block_or_zero(dr, idx, dr_start).rename("dryer_kw"))
 
         # EV (⚠️ needs dt_h for energy target)
-        if use_ev and float(st.session_state.get("ev_e", 0)) > 0 and float(st.session_state.get("ev_p", 0)) > 0:
+        ev_energy=(float(st.session_state["ev_t"])-float(st.session_state["ev_a"]))
+        if use_ev and ev_energy > 0 and float(st.session_state.get("ev_p", 0)) > 0:
             ev = EVCharger(
                 power_kw=float(st.session_state["ev_p"]),
-                energy_target_kwh=float(st.session_state["ev_e"]),
+                energy_target_kwh=(float(st.session_state["ev_t"])-float(st.session_state["ev_a"]))/100*float(st.session_state["ev_q"]),
                 window_start=st.session_state["ev_ws"],
                 window_end=st.session_state["ev_we"],
             )
@@ -467,6 +467,8 @@ def compute_load_env(day, step_min, weather_hr, use_baseload, use_lights, use_ho
                                 st.session_state["ev_sched"], st.session_state.get("ev_manual"), idx)
             # EV block_kw expects dt_h
             load_parts.append(block_or_zero(ev, idx, ev_start, dt_h).rename("ev_kw"))
+
+
 
     # ---- reuse your existing block scheduling code here (omitted for brevity) ----
     # Append each device's series to load_parts when scheduled.
@@ -496,8 +498,6 @@ def compute_load_env(day, step_min, weather_hr, use_baseload, use_lights, use_ho
         load_parts.append(hp.series_kw(idx, tout_minute))
 
 
-
-
     else:
         pass  
 
@@ -512,7 +512,7 @@ def compute_load_env(day, step_min, weather_hr, use_baseload, use_lights, use_ho
 
     notes = dict(price=note_price, co2=note_co2, temp=note_temp)
     return dict(idx=idx, dt_h=dt_h, load=load, pv=pv, price=price_plot,price_hourly=price_hourly, co2=co2, tout=tout_minute,
-                parts_df=parts_df, notes=notes)
+                parts_df=parts_df, signal=signal, notes=notes )
 
 def show_load_env(sim):
     """Plots/tables for the first step."""
@@ -933,14 +933,6 @@ def daily_price_dual(idx_min: pd.DatetimeIndex, day: date, area="DK1"):
     return price_plot, price_hourly, note
 
 
-def align_daily_series(idx: pd.DatetimeIndex, s: pd.Series) -> pd.Series:
-    start, end = idx[0], idx[-1]
-    # derive step minutes robustly
-    step_min = int((idx[1] - idx[0]).total_seconds() // 60) if len(idx) > 1 else 1
-    ss = s.loc[(s.index >= start) & (s.index <= end + pd.Timedelta(minutes=step_min))]
-    if getattr(ss.index, "tz", None) is not None:
-        ss.index = ss.index.tz_localize(None)
-    return ss.reindex(idx).interpolate().bfill().ffill()
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_co2_for_day(day: date, area: str = "DK1") -> pd.Series:
     """Return local-naive 5-min gCO2/kWh series for the given calendar day. May contain NaNs."""
@@ -1300,15 +1292,17 @@ use_ev = st.checkbox("EV charging", value=True, key="ev_on")
 if use_ev:
     with st.expander("EV settings"):
         ev_power_kw = st.number_input("Charger power (kW)", min_value=1.0, value=11.0, step=0.5, key="ev_p")
-        ev_energy_target = st.number_input("Energy target (kWh)", min_value=0.0, value=50.0, step=1.0, key="ev_e")
+        ev_capacity_kwh = st.number_input("EV capacity (kWh)", min_value=50.0, value=75.0, step=0.5, key="ev_q")
+        ev_soc_arrive= st.number_input("SOC arrive (%)", min_value=0.0, value=20.0, step=5.0, key="ev_a")
+        ev_soc_target = st.number_input("SOC target (%)", min_value=0.0, value=80.0, step=5.0, key="ev_t")
         ev_win_start = st.time_input("Allowed start ≥", value=time(1,0), key="ev_ws")
         ev_win_end = st.time_input("Allowed end <", value=time(6,0), key="ev_we")
         ev_sched = st.radio("Scheduling", ["Auto (optimize)", "Manual fixed start"], horizontal=True, key="ev_sched")
         ev_manual_start = st.time_input("Manual start", value=time(1,0), key="ev_manual") if ev_sched=="Manual fixed start" else None
-if use_ev and st.session_state["ev_e"] > 0 and st.session_state["ev_p"] > 0:
+if use_ev and (float(st.session_state["ev_t"])-float(st.session_state["ev_a"])) > 0 and st.session_state["ev_p"] > 0:
     ev_prev = EVCharger(
         power_kw=float(st.session_state["ev_p"]),
-        energy_target_kwh=float(st.session_state["ev_e"]),
+        energy_target_kwh=(float(st.session_state["ev_t"])-float(st.session_state["ev_a"]))/100*float(st.session_state["ev_q"]),
         window_start=st.session_state["ev_ws"],
         window_end=st.session_state["ev_we"],
     )
@@ -1477,12 +1471,20 @@ if ems_col.button("⚡ Run EMS on current simulation", disabled=ems_disabled):
     if sim is None:
         st.warning("Run simulation first.")
     else:
-        # Build hourly df → auto/ manual slots → plan_df exactly as you already do:
-        df_hourly = (pd.DataFrame({
-            "load": sim["load"], "pv": sim["pv"], "price": sim["price_hourly"],
-        }).resample("h").mean()
-          .reset_index()
-          .rename(columns={"index":"DateTime","price":"ElectricityPrice","load":"Load","pv":"PV"}))
+        # Minute-level dataframe from sim (uses sim["idx"] as DateTime)
+        df_minute = (
+            pd.DataFrame({
+                "DateTime": sim["idx"],
+                "Load":     sim["load"].values,          # kW, minute cadence
+                "PV":       sim["pv"].values,            # kW, minute cadence
+                "ElectricityPrice": sim["price"].values, # DKK/kWh, step-held to minutes already
+                "signal":   sim["signal"].values,        # your device signal (0..1)
+                "co2":      sim["co2"].values,           # gCO2/kWh, step-held to minutes already
+            })
+            .sort_values("DateTime")
+        )
+
+
 
         # Choose slot source (manual from sidebar, or auto)
         if slot_mode.startswith("Manual"):
@@ -1490,15 +1492,15 @@ if ems_col.button("⚡ Run EMS on current simulation", disabled=ems_disabled):
             plan_df = pd.DataFrame(manual_plan_rows)  # columns: start,end,soc_setpoint_pct,grid_charge_allowed
         else:
             # Auto slots from your existing functions
-            time_slots = generate_smart_time_slots(df_hourly)
-            df_slots   = assign_data_to_time_slots_single(df_hourly, time_slots)
+            time_slots = generate_smart_time_slots(df_minute)
+            df_slots   = assign_data_to_time_slots_single(df_minute, time_slots)
             SOC0 = float(st.session_state["batt_soc_pct"])
             SOC_min = float(st.session_state.get("soc_min_pct", 15.0))   # <- user input
             SOC_max = 100.0
-            SOC_opt, Qgrid, _ = mpc_opt_single(
+            SOC_opt, Qgrid,_ = mpc_opt_single(
                 df_slots, SOC0=SOC0, SOC_min=SOC_min, SOC_max=SOC_max,
                 Pbat_chargemax=st.session_state["batt_pow"],
-                Qbat=st.session_state["batt_cap"]
+                Qbat=st.session_state["batt_cap"],
             )
             df_plan = format_results_single(SOC_opt, Qgrid, df_slots)
             df_today = df_plan[df_plan["Datetime"] == df_plan["Datetime"].iloc[0]].copy()
@@ -1616,3 +1618,4 @@ if st.session_state.get("ems") is not None:
     render_ems(st.session_state["sim"], st.session_state["ems"])  # keys like "ems_split", "ems_soc"
 
 
+#%%
