@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, date, time
 
+
 def minute_index(day: date, step_min: int = 1) -> pd.DatetimeIndex:
     start = datetime.combine(day, time(0,0))
     periods = (24*60)//step_min
