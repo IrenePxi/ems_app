@@ -3,11 +3,10 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, date, time
 
-
-def minute_index(day: date, step_min: int = 1) -> pd.DatetimeIndex:
-    start = datetime.combine(day, time(0,0))
-    periods = (24*60)//step_min
-    return pd.date_range(start=start, periods=periods, freq=f"{step_min}min")
+def minute_index(period_start: date, period_end: date, step_min: int = 1) -> pd.DatetimeIndex:
+    start = datetime.combine(period_start, time(0, 0))
+    end   = datetime.combine(period_end, time(23, 59))
+    return pd.date_range(start=start, end=end, freq=f"{step_min}min")
 
 def default_price_profile(idx: pd.DatetimeIndex) -> pd.Series:
     minutes = (idx.view('i8') - idx[0].to_datetime64().astype('datetime64[ns]').astype('int64')) // (60*10**9)
