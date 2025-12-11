@@ -4,13 +4,13 @@ import streamlit as st
 from datetime import datetime, date, time
 import pandas as pd  
 import numpy as np
+from pathlib import Path
 
 from datetime import date, datetime, timedelta
 import json
 import requests
 import plotly.graph_objects as go
 import numpy as np
-import pandas as pd
 from datetime import time as _time, date as _date
 from profiles import minute_index, default_price_profile, default_co2_profile, simple_pv_profile, synthetic_outdoor_temp
 from devices import  WeatherHP,WeatherELheater,WeatherHotTub, DHWTank
@@ -20,7 +20,88 @@ from pvlib.temperature import TEMPERATURE_MODEL_PARAMETERS
 from scipy.optimize import minimize
 from ems import rule_power_share
 from Optimization_based import generate_smart_time_slots, assign_data_to_time_slots_single, mpc_opt_single, mpc_opt_multi, format_results_single
+#%% front page
 
+LOG_PATH = Path("usage_log.csv")
+
+
+def log_user_profile_to_csv(profile: dict):
+    """Append one row to a local CSV file."""
+    is_new = not LOG_PATH.exists()
+    df_row = pd.DataFrame(
+        [{
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "occupation": profile.get("occupation", ""),
+            "location": profile.get("location", ""),
+            "session_id": st.session_state.get("session_id", ""),
+        }]
+    )
+    if is_new:
+        df_row.to_csv(LOG_PATH, index=False, mode="w")
+    else:
+        df_row.to_csv(LOG_PATH, index=False, mode="a", header=False)
+
+
+def ensure_user_profile():
+    """
+    Hard gate: show a small intro form until user has provided
+    occupation + living location.
+    Call this ONCE at the start of the app.
+    """
+    # cheap session id
+    st.session_state.setdefault("session_id", datetime.now().strftime("%Y%m%d-%H%M%S"))
+
+    if st.session_state.get("user_profile_confirmed"):
+        return  # already done
+
+    st.title("Daily EMS Sandbox")
+    st.subheader("Before we start, tell us a bit about yourself 👇")
+
+    occupation = st.radio(
+        "Your current role",
+        [
+            "Bachelor student",
+            "Master student",
+            "PhD student",
+            "Research assistant",
+            "Postdoc",
+            "Assistant Professor",
+            "Associate Professor",
+            "Professor",
+            "Industry",
+            "Others",
+        ],
+        index=None,
+        help="We only use this for anonymous statistics about who is using the tool.",
+    )
+    
+
+    location = st.text_input(
+        "Where do you live?",
+        placeholder="City, Country (e.g. Aalborg, Denmark)",
+    )
+
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        ready = bool(occupation) and bool(location.strip())
+        clicked = st.button("Start using the app ▶️", disabled=not ready)
+
+    if clicked and ready:
+        profile = {
+            "occupation": occupation,
+            "location": location.strip(),
+        }
+        st.session_state["user_profile"] = profile
+        st.session_state["user_profile_confirmed"] = True
+
+        # log to CSV (local; you can later replace this with DB / Google Sheet, etc.)
+        log_user_profile_to_csv(profile)
+
+        st.rerun()
+
+    # HARD STOP: do not render rest of the app yet
+    st.stop()
+ensure_user_profile()
 #%% helper for page 1
 # -------- EnergiDataService endpoints --------
 EDS_PRICE_URL_OLD = "https://api.energidataservice.dk/dataset/Elspotprices"
@@ -592,6 +673,173 @@ def smooth_fc_schedule(p_fc: pd.Series,
 #%% helper for page 2    
 import streamlit as st
 import plotly.graph_objects as go
+from datetime import datetime, date as _date
+
+def get_thermal_building_params():
+    """
+    Map global house_info (size, insulation) to:
+      - ua_base  [kW/°C]
+      - q_guess  [kW]
+      - Cth_guess [kWh/°C]
+    """
+    hi = st.session_state.get("house_info", {
+        "size": "Medium house",
+        "insulation": "Average",
+        "residents": 2,
+    })
+    size = hi.get("size", "Medium house")
+    ins  = hi.get("insulation", "Average")
+
+    # base UA & capacity guess by size
+    if size == "Small apartment":
+        ua_base = 0.10
+        q_guess = 4.0
+        Cth_guess = 0.50
+    elif size == "Large house":
+        ua_base = 0.14
+        q_guess = 8.0
+        Cth_guess = 0.75
+    else:  # "Medium house"
+        ua_base = 0.12
+        q_guess = 6.0
+        Cth_guess = 0.60
+
+    # adjust UA by insulation
+    if ins == "Poor":
+        ua = ua_base * 1.3
+    elif ins == "Good":
+        ua = ua_base * 0.7
+    else:
+        ua = ua_base
+
+    return ua, q_guess, Cth_guess, size, ins
+def get_outdoor_minute_profile():
+    """
+    Return (idx_minute, tout_minute Series) for the selected day.
+    Uses temp_daily from session if available; otherwise synthetic profile.
+    """
+    if (
+        "temp_daily" in st.session_state
+        and isinstance(st.session_state["temp_daily"], pd.Series)
+        and not st.session_state["temp_daily"].empty
+    ):
+        tout_tot = st.session_state["temp_daily"]
+        # you already have this helper elsewhere:
+        tout_minute = get_selected_day_data(tout_tot)
+        idx = tout_minute.index
+        st.caption("Using fetched outdoor temperature for this preview.")
+        return idx, tout_minute.astype(float)
+
+    # fallback: synthetic daily sinusoid
+    idx = pd.date_range("2025-01-10 00:00", periods=24 * 60, freq="min")
+    hours = idx.hour + idx.minute / 60.0
+    tout_minute = pd.Series(
+        5.0 + 5.0 * np.sin(2 * np.pi * (hours - 15) / 24.0),
+        index=idx,
+        name="Tout_C",
+    )
+    st.caption(
+        "No weather data found, using a synthetic outdoor temperature profile."
+    )
+    return idx, tout_minute.astype(float)
+
+def suggest_best_interval_for_day(
+    duration_min: int,
+    w_cost: float = 0.5,
+    earliest: time | None = None,
+    latest:  time | None = None,
+) -> dict | None:
+    """
+    Returns {"start": time, "end": time} for the chosen day,
+    restricted to [earliest, latest] if provided.
+    """
+    price = st.session_state.get("price_daily")
+    co2   = st.session_state.get("co2_daily")
+
+    sel_day = st.session_state.get("day")
+
+    if not isinstance(sel_day, _date):
+        pr = st.session_state.get("period_range")
+        if pr and len(pr) == 2 and isinstance(pr[1], _date):
+            sel_day = pr[1]
+
+    if price is None or co2 is None or len(price) == 0 or not isinstance(sel_day, _date):
+        return None
+
+    df = pd.DataFrame(index=price.index.copy())
+    df["price"] = np.asarray(price, dtype=float)
+    df["co2"]   = co2.reindex(df.index).interpolate().bfill().ffill()
+
+    day_start = pd.Timestamp(sel_day)
+    day_end   = day_start + pd.Timedelta(days=1)
+    df = df.loc[(df.index >= day_start) & (df.index < day_end)]
+    if df.empty:
+        return None
+
+    # apply allowed window
+    if earliest is not None and latest is not None:
+        e_min = earliest.hour * 60 + earliest.minute
+        l_min = latest.hour * 60 + latest.minute
+        minutes_of_day = df.index.hour * 60 + df.index.minute
+        if e_min <= l_min:
+            mask = (minutes_of_day >= e_min) & (minutes_of_day <= l_min)
+        else:
+            # window wraps midnight
+            mask = (minutes_of_day >= e_min) | (minutes_of_day <= l_min)
+        df = df.loc[mask]
+        if df.empty:
+            return None
+
+    # normalize
+    for col in ["price", "co2"]:
+        x = df[col].values.astype(float)
+        mn, mx = np.nanmin(x), np.nanmax(x)
+        if mx > mn:
+            df[col] = (x - mn) / (mx - mn)
+        else:
+            df[col] = 0.5
+
+    w_cost = float(np.clip(w_cost, 0.0, 1.0))
+    df["score"] = w_cost * df["price"] + (1.0 - w_cost) * df["co2"]
+
+    n = len(df)
+    dur = int(duration_min)
+    if dur <= 0:
+        dur = 30
+    if dur > n:
+        dur = n
+
+    best_score = None
+    best_t0 = None
+    for t0 in range(0, n - dur + 1):
+        sc = float(df["score"].iloc[t0:t0 + dur].mean())
+        if best_score is None or sc < best_score:
+            best_score = sc
+            best_t0 = t0
+
+    if best_t0 is None:
+        return None
+
+    t_start = df.index[best_t0]
+    t_end   = df.index[best_t0 + dur - 1] + pd.Timedelta(minutes=1)
+
+    start_min = t_start.hour * 60 + t_start.minute
+    end_min   = t_end.hour * 60 + t_end.minute
+    start_min = max(0, min(start_min, 24 * 60 - 1))
+    end_min   = max(1, min(end_min,   24 * 60 - 1))
+
+    return {
+        "start": _time(start_min // 60, start_min % 60),
+        "end":   _time(end_min   // 60, end_min   % 60),
+    }
+
+
+def extract_icon(label: str) -> str:
+    """Return only the emoji part of a label."""
+    if " " in label:
+        return label.split(" ", 1)[0]
+    return label  # fallback
+
 def normalize_to_dummy_day(s: pd.Series,
                            dummy_date: pd.Timestamp = pd.Timestamp("2000-01-01")) -> pd.Series:
     """
@@ -760,2238 +1008,3228 @@ def get_selected_day_data(input_series):
     df = df.loc[(df.index >= day_start) & (df.index < day_end)]
 
     return df
-def render_devices_page_house():
-    # --- 1) Init device on/off state once ---
-    if "devices_enabled" not in st.session_state:
-        st.session_state["devices_enabled"] = {
-            # Electrical – fixed
-            "lights": True,
-            "hood": True,
-            "fridge": True,
-            # Electrical – flexible
-            "wm": True,
-            "dw": True,
-            "dryer": False,
-            # Thermal
-            "hp": True,
-            "e_heater": False,
-            "hot_tub": False,
-            # Generation & storage
-            "pv": True,
-            "battery": True,
-            "fuel_cell": False,
-            "diesel": False,
-            # EV
-            "ev": True,
-        }
 
-    if "devices" not in st.session_state:
-        st.session_state["devices"] = {
-            "elec_fixed": [
-            ],
-            "elec_flex": [
 
-            ],
-            "thermal": [
 
-            ],
-            "gen_store": [
- 
-            ],
-            "ev": [
-                {"id": "ev_1", "type": "ev", "name": "EV"},
-            ],
-        }
+    
 
-    devices = st.session_state["devices"]
+def suggest_best_interval_for_ev(duration_min: int,
+                                w_cost: float,
+                                window_start_min: int = 60,
+                                window_end_min: int = 360) -> dict | None:
+    """
+    Find best continuous interval of given length within [01:00, 06:00)
+    using selected-day price & CO2 (minute series).
+    Returns {"start": time, "end": time} or None.
+    """
+    import numpy as np
+    import pandas as pd
 
-    # --- 2) Init per-device configuration (power, schedule) ---
-    if "device_configs" not in st.session_state:
-        st.session_state["device_configs"] = {}
-    device_configs = st.session_state["device_configs"]
+    price_all = st.session_state.get("price_daily")
+    co2_all   = st.session_state.get("co2_daily")
 
-    # Max devices per category (tuned so icons stay inside the colored areas)
-    MAX_PER_CATEGORY = {
-        "elec_fixed": 20,   # 5 x 4 grid
-        "elec_flex":  20,   # 5 x 4 grid
-        "thermal":    16,   # 4 x 4 grid
-        "gen_store":  12,   # triangular arrangement (2 + 4 + 6)
-        "ev":         2,    # up to 2 EV chargers stacked
+    if not isinstance(price_all, pd.Series) or price_all.empty:
+        return None
+    if not isinstance(co2_all, pd.Series) or co2_all.empty:
+        return None
+
+    # Slice to selected day (same helper you already use elsewhere)
+    price = get_selected_day_data(price_all)
+    co2   = get_selected_day_data(co2_all)
+
+    if price is None or co2 is None or price.empty or co2.empty:
+        return None
+
+    # Make sure aligned indices
+    price, co2 = price.align(co2, join="inner")
+    idx = price.index
+    n = len(idx)
+    if n == 0 or duration_min <= 0 or duration_min > n:
+        return None
+
+    rel_min = idx.hour * 60 + idx.minute
+    prices  = price.values.astype(float)
+    co2v    = co2.values.astype(float)
+
+    w_c   = float(w_cost)
+    w_co2 = 1.0 - w_c
+
+    best_score = None
+    best_start_pos = None
+
+    # candidate starts only inside [window_start_min, window_end_min)
+    candidates = np.where(
+        (rel_min >= window_start_min) & (rel_min < window_end_min)
+    )[0]
+
+    for start_pos in candidates:
+        end_pos = start_pos + duration_min
+        if end_pos > n:
+            break
+        # ensure the *end* of block is still inside window
+        if rel_min[end_pos - 1] >= window_end_min:
+            continue
+
+        p_seg = prices[start_pos:end_pos]
+        c_seg = co2v[start_pos:end_pos]
+        score = w_c * p_seg.mean() + w_co2 * c_seg.mean()
+
+        if best_score is None or score < best_score:
+            best_score = score
+            best_start_pos = start_pos
+
+    if best_start_pos is None:
+        return None
+
+    start_ts = idx[best_start_pos]
+    end_ts   = idx[min(best_start_pos + duration_min, n - 1)] + pd.Timedelta(minutes=1)
+
+    return {
+        "start": start_ts.time(),
+        "end":   end_ts.time(),
     }
 
-    TYPE_ICONS = {
-        "lights":    "💡",
-        "hood":      "🍳",
-        "fridge":    "🧊",
-        "wm":        "🧺",
-        "dw":        "🍽",
-        "dryer":     "🌀",
-        "hp":        "❄️",
-        "e_heater":  "🔥",
-        "hot_tub":   "🛁",
-        "dhw":       "🚿",   
-        "pv":        "☀️",
-        "battery":   "🔋",
-        "fuel_cell": "🧪",
-        "diesel":    "⛽",
-        "ev":        "🚗",
-        "other":     "🔌",
-    }
+    
 
-    # ---- default config for a device type (used when first opening settings) ----
-    def get_default_device_config(dev_type: str) -> dict:
-        from datetime import time as _time
-        if dev_type == "lights":
-            return {
+# -------------------------------------------------------------------
+# Helper: default config per device type
+# -------------------------------------------------------------------
+def get_default_config(dev_type: str, category: str) -> dict:
+    """Return default config (power, schedule, etc.) for a device."""
+    base = dict(
+        power_kw=0.5,
+        start=_time(18, 0),
+        duration_min=60,
+    )
+
+    # ====== read house_info and map to small/medium/large ==========
+    hi = st.session_state.get("house_info", {
+        "size": "Medium house",
+        "insulation": "Average",
+        "residents": 2,
+    })
+    size_str = (hi.get("size") or "Medium house").lower()
+
+    if "small" in size_str:
+        size = "small"
+    elif "large" in size_str:
+        size = "large"
+    else:
+        size = "medium"
+
+    def _by_size(small: int, medium: int, large: int) -> int:
+        if size == "small":
+            return small
+        if size == "large":
+            return large
+        return medium
+
+    # ======================================================
+    # 1) FIXED ELECTRICAL (all 17 + other slots)
+    # ======================================================
+    if category == "elec_fixed":
+        # All powers are per device (W).
+        # num_devices scales with house size where it makes sense.
+        defaults: dict[str, dict] = {
+            "lights": {
+                "num_devices": _by_size(8, 12, 18),
+                "power_w": 8.0,  # per LED fixture
+                "intervals": [
+                    {"start": _time(6, 0),  "end": _time(8, 0)},   # morning
+                    {"start": _time(17, 0), "end": _time(23, 0)},  # evening
+                ],
+            },
+            "fridge": {
                 "num_devices": 1,
-                "power_w": 20.0,
-                "intervals": [{"start": _time(18, 0), "end": _time(23, 0)}],
-            }
-        if dev_type == "hood":
-            return {
+                "power_w": 80.0,  # average over compressor cycling
+                "intervals": [
+                    {"start": _time(0, 0), "end": _time(23, 59)},
+                ],
+            },
+            "freezer": {
+                "num_devices": _by_size(1, 1, 2),
+                "power_w": 90.0,
+                "intervals": [
+                    {"start": _time(0, 0), "end": _time(23, 59)},
+                ],
+            },
+            "fridge_freezer": {
+                "num_devices": _by_size(1, 1, 2),
+                "power_w": 110.0,
+                "intervals": [
+                    {"start": _time(0, 0), "end": _time(23, 59)},
+                ],
+            },
+            "range_hood": {
                 "num_devices": 1,
+                "power_w": 120.0,
+                "intervals": [
+                    {"start": _time(18, 0), "end": _time(19, 0)},  # cooking
+                ],
+            },
+            "oven": {
+                "num_devices": _by_size(1, 1, 2),
+                "power_w": 2000.0,
+                "intervals": [
+                    {"start": _time(18, 0), "end": _time(19, 0)},
+                ],
+            },
+            "induction": {
+                "num_devices": 1,
+                "power_w": 2500.0,
+                "intervals": [
+                    {"start": _time(17, 30), "end": _time(19, 0)},
+                ],
+            },
+            "microwave": {
+                "num_devices": 1,
+                "power_w": 1200.0,
+                "intervals": [
+                    {"start": _time(7,  0), "end": _time(7, 15)},
+                    {"start": _time(12, 0), "end": _time(12, 15)},
+                    {"start": _time(21, 0), "end": _time(21, 15)},
+                ],
+            },
+            "tv": {
+                "num_devices": _by_size(1, 1, 2),
+                "power_w": 80.0,
+                "intervals": [
+                    {"start": _time(19, 0), "end": _time(23, 0)},
+                ],
+            },
+            "router": {
+                "num_devices": _by_size(1, 2, 3),
+                "power_w": 10.0,
+                "intervals": [
+                    {"start": _time(0, 0), "end": _time(23, 59)},
+                ],
+            },
+            "pc_desktop": {
+                "num_devices": _by_size(1, 1, 2),
                 "power_w": 150.0,
                 "intervals": [
-                    {"start": _time(12, 0), "end": _time(12, 30)},
-                    {"start": _time(18, 0), "end": _time(18, 30)},
+                    {"start": _time(9, 0), "end": _time(17, 0)},   # work-from-home
                 ],
-            }
-        if dev_type == "fridge":
-            return {
-                "num_devices": 1,
+            },
+            "laptop": {
+                "num_devices": _by_size(1, 2, 3),
                 "power_w": 60.0,
-                "intervals": [{"start": _time(0, 0), "end": _time(23, 59)}],
-            }
-        
-        if dev_type == "ev":
-            return {
-                "intervals": [{"start": _time(1, 0), "end": _time(6, 0)}],
-            }
-        
-        if dev_type == "hp":
-            # User-friendly HP config: comfort + qualitative house info
-            return {
-                "t_min_c": 20.0,
-                "t_max_c": 22.0,
-                "house_size": "Medium house",      # "Small apartment" / "Medium house" / "Large house"
-                "insulation": "Average",           # "Poor" / "Average" / "Good"
-                "q_rated_kw": 6.0,                 # default capacity (kW)
-            }
-        
-        if dev_type == "e_heater":
-            # User-friendly HP config: comfort + qualitative house info
-            return {
-                "t_min_c": 20.0,
-                "t_max_c": 22.0,
-                "house_size": "Medium house",      # "Small apartment" / "Medium house" / "Large house"
-                "insulation": "Average",           # "Poor" / "Average" / "Good"
-                "q_rated_kw": 6.0,                 # default capacity (kW)
-            }
+                "intervals": [
+                    {"start": _time(9, 0),  "end": _time(12, 0)},
+                    {"start": _time(19, 0), "end": _time(23, 0)},
+                ],
+            },
+            "game_console": {
+                "num_devices": _by_size(1, 1, 2),
+                "power_w": 120.0,
+                "intervals": [
+                    {"start": _time(20, 0), "end": _time(22, 0)},
+                ],
+            },
+            "printer": {
+                "num_devices": _by_size(1, 1, 2),
+                "power_w": 40.0,
+                "intervals": [
+                    {"start": _time(10, 0), "end": _time(12, 0)},  # sporadic use
+                ],
+            },
+            "ventilation": {
+                "num_devices": 1,
+                "power_w": 60.0,   # HRV unit
+                "intervals": [
+                    {"start": _time(0, 0), "end": _time(23, 59)},
+                ],
+            },
+            "humidifier": {
+                "num_devices": _by_size(1, 1, 2),
+                "power_w": 40.0,
+                "intervals": [
+                    {"start": _time(22, 0), "end": _time(7, 0)},  # night
+                ],
+            },
+            "baby_monitor": {
+                "num_devices": _by_size(1, 1, 1),
+                "power_w": 5.0,
+                "intervals": [
+                    {"start": _time(19, 0), "end": _time(7, 0)},
+                ],
+            },
+            "smoke_detector": {
+                "num_devices": _by_size(2, 3, 4),
+                "power_w": 2.0,
+                "intervals": [
+                    {"start": _time(0, 0), "end": _time(23, 59)},
+                ],
+            },
+            "standby": {
+                "num_devices": 1,
+                "power_w": _by_size(30.0, 50.0, 80.0),  # sum of small phantom loads
+                "intervals": [
+                    {"start": _time(0, 0), "end": _time(23, 59)},
+                ],
+            },
 
-        if dev_type == "pv":
-            # defaults similar to your old UI: 16 × 400 W, 30° tilt, 180° az, 14% losses
-            return {
+            # You can also initialize the 3 "other" slots
+            "other_fixed_1": {
+                "num_devices": 1,
+                "power_w": 100.0,
+                "intervals": [
+                    {"start": _time(18, 0), "end": _time(22, 0)},
+                ],
+            },
+            "other_fixed_2": {
+                "num_devices": 1,
+                "power_w": 100.0,
+                "intervals": [
+                    {"start": _time(18, 0), "end": _time(22, 0)},
+                ],
+            },
+            "other_fixed_3": {
+                "num_devices": 1,
+                "power_w": 100.0,
+                "intervals": [
+                    {"start": _time(18, 0), "end": _time(22, 0)},
+                ],
+            },
+        }
+
+        cfg = defaults.get(dev_type, {}).copy()
+        if not cfg:
+            # unknown device → just base
+            return base
+
+        # derive power_kw / start / duration_min for compatibility
+        first_iv = cfg["intervals"][0]
+        start_t = first_iv["start"]
+        end_t   = first_iv["end"]
+
+        # assume same day; if end < start we treat it as overnight (add 24h)
+        start_dt = datetime.combine(date.today(), start_t)
+        end_dt   = datetime.combine(date.today(), end_t)
+        if end_dt <= start_dt:
+            end_dt = end_dt.replace(day=end_dt.day + 1)
+
+        dur_min = int((end_dt - start_dt).total_seconds() / 60.0)
+        if dur_min <= 0:
+            dur_min = 60
+
+        cfg["power_kw"] = cfg["power_w"] / 1000.0
+        cfg["start"] = start_t
+        cfg["duration_min"] = dur_min
+
+        # merge with base so we still have generic keys
+        return {**base, **cfg}
+    
+    # ======================================================
+    # 2) FLEXIBLE ELECTRICAL (shiftable loads)
+    # ======================================================
+    if category == "elec_flex":
+        # small helper already defined above in your function:
+        #   size = "small"/"medium"/"large"
+        #   def _by_size(small, medium, large): ...
+
+        defaults: dict[str, dict] = {
+            # Washing machine
+            "wm": {
+                "num_devices": 1,
+                "power_w": 1200.0,
+                "start": _time(19, 0),      # typical evening wash
+                "duration_min": 90,
+                "w_cost": 1,
+            },
+            # Dishwasher
+            "dw": {
+                "num_devices": 1,
+                "power_w": 1400.0,
+                "start": _time(21, 0),      # after dinner
+                "duration_min": 90,
+                "w_cost": 1,
+            },
+            # Tumble dryer (resistive)
+            "dryer": {
+                "num_devices": 1,
+                "power_w": 2000.0,
+                "start": _time(20, 0),
+                "duration_min": 60,
+                "w_cost": 1,
+            },
+            # Robot vacuum
+            "robot_vac": {
+                "num_devices": 1,
+                "power_w": 250.0,
+                "start": _time(11, 0),      # mid-day cleaning
+                "duration_min": 60,
+                "w_cost": 1,
+            },
+            # Workshop / hobby tools
+            "workshop": {
+                "num_devices": 1,
+                "power_w": 700.0,
+                "start": _time(17, 0),
+                "duration_min": 120,
+                "w_cost": 1,
+            },
+
+            # you can add more flexible types later, just extend DEVICE_CATEGORIES
+            # and add entries here with the same pattern.
+
+            # custom slots – just give a neutral default
+            "other_flex_1": {
+                "num_devices": 1,
+                "power_w": 1000.0,
+                "start": _time(18, 0),
+                "duration_min": 60,
+                "w_cost": 1,
+            },
+            "other_flex_2": {
+                "num_devices": 1,
+                "power_w": 1000.0,
+                "start": _time(18, 0),
+                "duration_min": 60,
+                "w_cost": 1,
+            },
+            "other_flex_3": {
+                "num_devices": 1,
+                "power_w": 1000.0,
+                "start": _time(18, 0),
+                "duration_min": 60,
+                "w_cost": 1,
+            },
+        }
+
+        cfg = defaults.get(dev_type, {}).copy()
+        if not cfg:
+            # unknown flexible type → fall back to generic
+            return base
+
+        # derive an initial single interval from start + duration_min
+        start_t = cfg.get("start", _time(20, 0))
+        dur_min = int(cfg.get("duration_min", 60))
+        if dur_min <= 0:
+            dur_min = 60
+
+        start_dt = datetime.combine(date.today(), start_t)
+        end_dt   = start_dt + timedelta(minutes=dur_min)
+        # clamp to time of day (ignore day overflow)
+        end_t = (end_dt.time().replace(second=0, microsecond=0))
+
+        cfg["intervals"] = [{"start": start_t, "end": end_t}]
+        cfg["power_kw"]  = float(cfg.get("power_w", base["power_kw"] * 1000.0)) / 1000.0
+        cfg["start"]     = start_t
+        cfg["duration_min"] = dur_min
+
+        # keep w_cost if present, default 0.5
+        cfg["w_cost"] = float(cfg.get("w_cost", 1))
+
+        return {**base, **cfg}
+
+
+    # ======================================================
+    # 2) FLEXIBLE / THERMAL / GEN / OUTSIDE  (unchanged)
+    # ======================================================
+
+    if category == "thermal":
+        defaults = {
+            # Space heating: external supply by default → no P_el
+            "space_heat": {
+                "space_mode": "None (external supply)",
+                "t_min_c": 20.0,
+                "t_max_c": 22.0,
+                # these are only used if user changes away from "None"
+                "q_kw": 6.0,
+            },
+            # DHW: external supply by default → no P_el
+            "dhw": {
+                "dhw_mode": "None (external supply)",
+                "volume_l": 200.0,
+                "usage_level": "Medium",
+                "t_min_c": 45.0,
+                "t_max_c": 55.0,
+                "p_el_kw": 2.0,
+            },
+            # Leisure: all disabled by default → no P_el
+            "leisure": {
+                "hot_tub_enabled": False,
+                "pool_enabled": False,
+            },
+        }
+
+        cfg = defaults.get(dev_type, {}).copy()
+        if not cfg:
+            # unknown thermal device: just inherit base but no real load
+            cfg = {}
+
+        # keep generic keys so other code that expects them doesn’t crash
+        cfg.setdefault("power_kw", base["power_kw"])
+        cfg.setdefault("start", base["start"])
+        cfg.setdefault("duration_min", base["duration_min"])
+
+        return {**base, **cfg}
+
+    if category == "gen_store":
+        # For now we only want PV to matter; others should default to 0 kW.
+        # Also override the base so gen_store things don't inherit 0.5 kW.
+        base_gen = dict(
+            power_kw=0.0,
+            start=_time(0, 0),
+            duration_min=0,
+        )
+
+        defaults = {
+            # PV: we don’t actually use power_kw/start/duration for PV,
+            # but we can store some sizing-related defaults here if you like.
+            "pv": {
                 "module_wp": 400.0,
                 "n_panels": 16,
                 "tilt": 30.0,
                 "azimuth": 180.0,
                 "loss_frac": 0.14,
-            }
-        
-        if dev_type == "battery":
-            return {
-                "capacity_kwh": 10.0,
-                "power_kw": 5.0,
-                "soc_init_pct": 50.0,
-                "soc_min_pct": 15.0,
-                "control_mode": "Auto",
-                "manual_slots": [],   # list of 6-slot dicts, empty initially
-                "rule_priority": 2,   # 2=Load-first, 1=Battery-first
-            }
+                # keep power_kw etc. at 0 so it never shows as a “load”
+                "power_kw": 0.0,
+                "start": _time(0, 0),
+                "duration_min": 0,
+            },
 
-        
-        # generic fallback
-        return {
-            "num_devices": 1,
-            "power_w": 100.0,
-            "intervals": [{"start": _time(8, 0), "end": _time(9, 30)}],
+            # everything else → no default power / duration
+            "battery":      {"power_kw": 0.0, "start": _time(0, 0), "duration_min": 0},
+            "fuel_cell":    {"power_kw": 0.0, "start": _time(0, 0), "duration_min": 0},
+            "diesel_gen":   {"power_kw": 0.0, "start": _time(0, 0), "duration_min": 0},
+            "electrolyzer": {"power_kw": 0.0, "start": _time(0, 0), "duration_min": 0},
         }
 
-    # ---- helper to suggest new intervals for flexible devices ----
-    # ---- helper: suggest ONE continuous interval for a flexible device ----
-        # ---- helper: suggest ONE continuous interval for a flexible device ----
-    def suggest_best_interval_for_day(duration_min: int,
-                                      w_cost: float = 0.5) -> dict | None:
-        """
-        Returns {"start": time, "end": time} for the chosen day.
-        Priority:
-          1) st.session_state["selected_day"]  (if valid)
-          2) period_range[1]  (end of selected period)
-        Returns None if no day or price/CO₂ data is available.
-        """
+        return {**base_gen, **defaults.get(dev_type, {})}
+
+    if category == "outside":
+        defaults = {
+            "ev11":         dict(power_kw=11.0, start=_time(1, 0), duration_min=240),
+            "ev22":         dict(power_kw=22.0, start=_time(1, 0), duration_min=120),
+            "ebike":        dict(power_kw=0.5,  start=_time(1, 0), duration_min=180),
+            "outdoor_light":dict(power_kw=0.2,  start=_time(17, 0),duration_min=600),
+            "patio_heater": dict(power_kw=2.0,  start=_time(18, 0),duration_min=240),
+        }
+        return {**base, **defaults.get(dev_type, {})}
+
+    return base   
+
+# -------------------------------------------------------------------
+# Device catalogue (labels + icons)
+# -------------------------------------------------------------------
+DEVICE_CATEGORIES = {
+    "elec_fixed": {
+        "title": "1a. Household electrical – fixed",
+        "help": "Devices that are hard to shift in time.",
+        "devices": [
+            ("lights",        "💡 Lights"),
+            ("fridge",        "🧊 Refrigerator"),
+            ("range_hood",    "🍳 Range hood"),
+            ("oven",          "🔥 Oven"),
+            ("induction",     "🍳 Induction stove"),
+            ("microwave",     "🎛️ Microwave"),
+            ("tv",            "📺 TV"),
+            ("router",        "🛜 Router"),
+            ("pc_desktop",    "🖥️ Desktop PC"),
+            ("laptop",        "💻 Laptop charger"),
+            ("game_console",  "🎮 Game console"),
+            ("printer",       "🖨️ Printer"),
+            ("ventilation",   "𖣘 Ventilation / HRV"),
+            ("humidifier",    "💧 Humidifier"),
+            ("baby_monitor",  "🚼 Baby monitor"),
+            ("smoke_detector","🚨 Smoke detector"),
+            ("standby",       "🔌 Standby loads"),
+
+            # --- 3 custom “other fixed” slots ---
+            ("other_fixed_1", "🧩 Other #1"),
+            ("other_fixed_2", "🧩 Other #2"),
+            ("other_fixed_3", "🧩 Other #3"),
+        ],
+    },
+    "elec_flex": {
+        "title": "1b. Household electrical – flexible",
+        "help": "Shiftable devices that can be move to cheaper/cleaner hours.",
+        "devices": [
+            ("wm",           "🧺 Washing machine"),
+            ("dw",           "🍽 Dishwasher"),
+            ("dryer",        "👕 Dryer"),
+            ("robot_vac",    "🧹 Robot vacuum"),
+            ("workshop",     "🔧 Workshop tools"),
+
+            # --- 3 custom “other flexible” slots ---
+            ("other_flex_1", "🧩 Other #1"),
+            ("other_flex_2", "🧩 Other #2"),
+            ("other_flex_3", "🧩 Other #3"),
+        ],
+    },
+    "thermal": {
+        "title": "2. Household thermal",
+        "help": "Space heating, domestic hot water and leisure thermal loads.",
+        "devices": [
+            ("space_heat", "🔥 Space heating"),
+            ("dhw",        "💧 DHW system"),
+            ("leisure",    "🧖 Leisure thermal loads"),
+            ],
+        },
+    "outside": {
+        "title": "3. Electrical Vehicles",
+        "help": "Electric vehicles.",
+        "devices": [
+            ("ev11",        "🚗 EV charger"),
+            ("ebike",       "🚲 E-bike charger"),
+        ],
+    },
+    "gen_store": {
+        "title": "4. Generation & storage",
+        "help": "PV, batteries and other on-site generation/storage units. (Currently only PV is available. Other models are under development)",
+        "devices": [
+            ("pv",          "☀️ PV system"),
+        ],
+    },
     
-        price = st.session_state.get("price_daily")
-        co2   = st.session_state.get("co2_daily")
+}
+from datetime import datetime, date, timedelta
 
-        # --- find the day to use ---
-        sel_day = st.session_state.get("day")
+# optional: build a lookup from full_key -> pretty label (for legend)
+DEVICE_LABEL_MAP = {
+    f"{cat}:{dev}": label
+    for cat, info in DEVICE_CATEGORIES.items()
+    for dev, label in info["devices"]
+}
+def resolve_display_label(full_key: str, dev_type: str, cfg_current: dict) -> str:
+    """
+    Reuse the same logic as device checkboxes:
+    - Use catalogue emoji + text
+    - For 'other_*' devices, replace text with custom_name if set.
+    """
+    base_label = DEVICE_LABEL_MAP.get(full_key, dev_type)
 
-        # fallback: use end of selected period if selected_day is missing
-        if not isinstance(sel_day, _date):
-            pr = st.session_state.get("period_range")
-            if pr and len(pr) == 2 and isinstance(pr[1], _date):
-                sel_day = pr[1]
-
-        # if still nothing usable → bail
-        if price is None or co2 is None or len(price) == 0 or not isinstance(sel_day, _date):
-            return None
-
-        # --- build unified dataframe over that day ---
-        df = pd.DataFrame(index=price.index.copy())
-        df["price"] = np.asarray(price, dtype=float)
-        df["co2"]   = co2.reindex(df.index).interpolate().bfill().ffill()
-
-        day_start = pd.Timestamp(sel_day)
-        day_end   = day_start + pd.Timedelta(days=1)
-
-        df = df.loc[(df.index >= day_start) & (df.index < day_end)]
-        if df.empty:
-            return None
-
-        # normalize to [0,1]
-        for col in ["price", "co2"]:
-            x = df[col].values.astype(float)
-            mn, mx = np.nanmin(x), np.nanmax(x)
-            if mx > mn:
-                df[col] = (x - mn) / (mx - mn)
+    if dev_type.startswith("other"):
+        custom_name = cfg_current.get("custom_name")
+        if custom_name:
+            # keep emoji from base_label if present
+            if " " in base_label:
+                emoji = base_label.split(" ", 1)[0]
             else:
-                df[col] = 0.5
+                emoji = "🧩"
+            return f"{emoji} {custom_name}"
 
-        w_cost = float(np.clip(w_cost, 0.0, 1.0))
-        df["score"] = w_cost * df["price"] + (1.0 - w_cost) * df["co2"]
-
-        n = len(df)
-        dur = int(duration_min)
-        if dur <= 0:
-            dur = 30
-        if dur > n:
-            dur = n
-
-        best_score = None
-        best_t0 = None
-
-        # simple sliding window
-        for t0 in range(0, n - dur + 1):
-            sc = float(df["score"].iloc[t0:t0 + dur].mean())
-            if best_score is None or sc < best_score:
-                best_score = sc
-                best_t0 = t0
-
-        if best_t0 is None:
-            return None
-
-        t_start = df.index[best_t0]
-        t_end   = df.index[best_t0 + dur - 1] + pd.Timedelta(minutes=1)
-
-        # clamp to valid 0..23:59 (avoid hour=24 problem)
-        start_min = t_start.hour * 60 + t_start.minute
-        end_min   = t_end.hour * 60 + t_end.minute
-        start_min = max(0, min(start_min, 24 * 60 - 1))
-        end_min   = max(1, min(end_min, 24 * 60 - 1))
-
-        return {
-            "start": _time(start_min // 60, start_min % 60),
-            "end":   _time(end_min   // 60, end_min   % 60),
-        }
-    
-
-    
-    
-
-    def suggest_best_interval_for_ev(duration_min: int,
-                                 w_cost: float,
-                                 window_start_min: int = 60,
-                                 window_end_min: int = 360) -> dict | None:
-        """
-        Find best continuous interval of given length within [01:00, 06:00)
-        using selected-day price & CO2 (minute series).
-        Returns {"start": time, "end": time} or None.
-        """
-        import numpy as np
-        import pandas as pd
-
-        price_all = st.session_state.get("price_daily")
-        co2_all   = st.session_state.get("co2_daily")
-
-        if not isinstance(price_all, pd.Series) or price_all.empty:
-            return None
-        if not isinstance(co2_all, pd.Series) or co2_all.empty:
-            return None
-
-        # Slice to selected day (same helper you already use elsewhere)
-        price = get_selected_day_data(price_all)
-        co2   = get_selected_day_data(co2_all)
-
-        if price is None or co2 is None or price.empty or co2.empty:
-            return None
-
-        # Make sure aligned indices
-        price, co2 = price.align(co2, join="inner")
-        idx = price.index
-        n = len(idx)
-        if n == 0 or duration_min <= 0 or duration_min > n:
-            return None
-
-        rel_min = idx.hour * 60 + idx.minute
-        prices  = price.values.astype(float)
-        co2v    = co2.values.astype(float)
-
-        w_c   = float(w_cost)
-        w_co2 = 1.0 - w_c
-
-        best_score = None
-        best_start_pos = None
-
-        # candidate starts only inside [window_start_min, window_end_min)
-        candidates = np.where(
-            (rel_min >= window_start_min) & (rel_min < window_end_min)
-        )[0]
-
-        for start_pos in candidates:
-            end_pos = start_pos + duration_min
-            if end_pos > n:
-                break
-            # ensure the *end* of block is still inside window
-            if rel_min[end_pos - 1] >= window_end_min:
-                continue
-
-            p_seg = prices[start_pos:end_pos]
-            c_seg = co2v[start_pos:end_pos]
-            score = w_c * p_seg.mean() + w_co2 * c_seg.mean()
-
-            if best_score is None or score < best_score:
-                best_score = score
-                best_start_pos = start_pos
-
-        if best_start_pos is None:
-            return None
-
-        start_ts = idx[best_start_pos]
-        end_ts   = idx[min(best_start_pos + duration_min, n - 1)] + pd.Timedelta(minutes=1)
-
-        return {
-            "start": start_ts.time(),
-            "end":   end_ts.time(),
-        }
-
-    
+    return base_label
 
 
 
-    # Helper to render one category list on the left
-    def render_category_ui(cat_key, title, type_choices):
-        """
-        type_choices: dict label -> internal_type (e.g. {"Lights": "lights", ...})
-        """
-        from datetime import time as _time
 
-        st.markdown(f"**{title}**")
-        dev_list = devices[cat_key]
+def compute_daily_profiles(sel: dict, cfgs: dict):
+    """
+    Build per-device and total daily profiles [kW] for all selected devices.
+    All profiles are returned on a 1-minute grid for a dummy day.
+    """
 
-        # Existing devices
-        if dev_list:
-            for i, dev in enumerate(dev_list):
-                settings_id = f"{cat_key}_{dev['id']}"
-                row = st.container()
-                with row:
-                    c0, c1, c2 = st.columns([0.15, 0.65, 0.20])
-                    with c0:
-                        st.markdown(TYPE_ICONS.get(dev["type"], "🔌"))
-                    with c1:
-                        new_name = st.text_input(
-                            "Device name",
-                            value=dev["name"],
-                            key=f"{cat_key}_name_{dev['id']}",
-                            label_visibility="collapsed",
-                        )
-                        dev["name"] = new_name
-                    with c2:
-                        col_set, col_del = st.columns(2)
-                        open_key = f"settings_open_{settings_id}"
-                        current_open = st.session_state.get(open_key, False)
-                        with col_set:
-                            if st.button("⚙️", key=f"{settings_id}_cfg", help="Settings"):
-                                st.session_state[open_key] = not current_open
-                                st.rerun()
-                        with col_del:
-                            if st.button("🗑", key=f"{settings_id}_del"):
-                                dev_list.pop(i)
-                                device_configs.pop(settings_id, None)
-                                st.rerun()
+    device_traces: dict[str, pd.Series] = {}
 
-                # ---- SETTINGS PANEL (under each row) ----
-                if st.session_state.get(f"settings_open_{settings_id}", False):
-                    cfg = device_configs.get(settings_id)
-                    if cfg is None:
-                        cfg = get_default_device_config(dev["type"])
-                        device_configs[settings_id] = cfg
+    # Common dummy day + 1-min index for the final plot
+    dummy_day = date(2025, 1, 10)
+    start_dt  = datetime.combine(dummy_day, time(0, 0))
+    idx_common = pd.date_range(start=start_dt, periods=24 * 60, freq="min")
 
-                    # top dashed line
-                    st.markdown(
-                        "<hr style='border-top: 1px dashed #bbb;'/>",
-                        unsafe_allow_html=True,
+    total = pd.Series(0.0, index=idx_common, name="P_total_kW")
+
+    def _map_to_dummy(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
+        """Map any datetime index to dummy_day, keeping only time-of-day."""
+        idx = pd.to_datetime(idx)
+        return pd.DatetimeIndex(
+            [datetime.combine(dummy_day, ts.time()) for ts in idx],
+            name="time",
+        )
+
+    for full_key, checked in sel.items():
+        if not checked:
+            continue
+
+        cfg = cfgs.get(full_key, {}) or {}
+        cat_key, dev_type = full_key.split(":", 1)
+
+        prof = None
+
+        # ----------------------------------------------------------
+        # 1) Try to use stored profile_index / profile_kw (1-min)
+        # ----------------------------------------------------------
+        idx_list = cfg.get("profile_index")
+        kw_list  = cfg.get("profile_kw")
+
+        if (
+            isinstance(idx_list, list)
+            and isinstance(kw_list, list)
+            and len(idx_list) == len(kw_list)
+            and len(idx_list) > 0
+        ):
+            try:
+                idx_local = pd.to_datetime(idx_list)
+                vals = np.asarray(kw_list, dtype=float)
+
+                idx_norm = _map_to_dummy(idx_local)
+                prof = pd.Series(vals, index=idx_norm, name=full_key)
+
+                # make sure we have exactly the full day, fill gaps with 0
+                prof = prof.reindex(idx_common, fill_value=0.0)
+            except Exception:
+                prof = None
+
+        # ----------------------------------------------------------
+        # 2) Fallback if we don't have a saved profile
+        # ----------------------------------------------------------
+        if prof is None:
+            if cat_key == "thermal":
+                # thermal devices → 0 kW until user opens settings and we save a profile
+                prof = pd.Series(0.0, index=idx_common, name=full_key)
+
+            else:
+                # generic fallback for electrical (fixed/flex/etc.)
+                num = int(cfg.get("num_devices", 1))
+
+                intervals = cfg.get("intervals")
+                if not intervals:
+                    start_t = cfg.get("start", time(18, 0))
+                    dur_min = int(cfg.get("duration_min", 60))
+                    start_local = datetime.combine(dummy_day, start_t)
+                    end_local   = start_local + timedelta(minutes=dur_min)
+                    intervals = [{"start": start_t, "end": end_local.time()}]
+
+                if cat_key in ("elec_fixed", "elec_flex"):
+                    power_w_per_dev = float(
+                        cfg.get("power_w", cfg.get("power_kw", 0.5) * 1000.0)
                     )
+                    power_w = power_w_per_dev * num
+                else:
+                    # other categories that still use power_kw
+                    power_w = float(cfg.get("power_kw", 0.5) * 1000.0) * num
 
-                    # ---------- FIXED ELECTRICAL LOADS ----------
-                    if cat_key == "elec_fixed":
-                        # Number of identical devices
-                        cfg["num_devices"] = int(
-                            st.number_input(
-                                "Number of devices",
-                                min_value=1,
-                                max_value=10,
-                                step=1,
-                                value=int(cfg.get("num_devices", 1)),
-                                key=f"{settings_id}_numdev",
-                            )
+                prof_raw = build_minute_profile(
+                    power_w=power_w,
+                    intervals=intervals,
+                    step_min=1,   # always 1-min internally
+                )
+
+                # normalize index to dummy day
+                if isinstance(prof_raw.index, pd.DatetimeIndex):
+                    prof_raw.index = _map_to_dummy(prof_raw.index)
+                else:
+                    prof_raw.index = idx_common
+
+                prof = prof_raw.reindex(idx_common, fill_value=0.0)
+                prof.name = full_key
+
+        device_traces[full_key] = prof
+        if not (cat_key == "gen_store" and dev_type == "pv"):
+            total = total.add(prof, fill_value=0.0)
+
+    if not device_traces:
+        total = pd.Series(0.0, index=idx_common, name="P_total_kW")
+
+    return idx_common, device_traces, total
+
+def build_series_for_analysis(sel: dict, cfgs: dict):
+    """
+    Use compute_daily_profiles(...) output and split into:
+      - total electrical load (all non-PV devices)
+      - total PV generation
+      - per-device daily energy (kWh) for loads
+    Returns:
+      idx, load_tot, pv_tot, energy_per_device
+    """
+    idx, device_traces, _total = compute_daily_profiles(sel, cfgs)
+
+    load_tot = pd.Series(0.0, index=idx, name="P_load_kW")
+    pv_tot   = pd.Series(0.0, index=idx, name="P_pv_kW")
+    energy_per_device: dict[str, float] = {}
+
+    for full_key, s in device_traces.items():
+        if s is None or s.empty:
+            continue
+
+        cat_key, dev_type = full_key.split(":", 1)
+
+        if cat_key == "gen_store" and dev_type == "pv":
+            # generation
+            pv_tot = pv_tot.add(s, fill_value=0.0)
+        else:
+            # everything else is electrical consumption
+            load_tot = load_tot.add(s, fill_value=0.0)
+            # store kWh (1-min resolution → divide by 60)
+            energy_per_device[full_key] = float(s.sum() / 60.0)
+
+    return idx, load_tot, pv_tot, energy_per_device
+
+def build_house_layout_figure(sel: dict, cfgs: dict) -> go.Figure:
+    """
+    Build house layout figure where each selected device appears as an
+    icon+name inside its zone.
+    """
+    fig = go.Figure()
+    shapes = []
+
+    # HOUSE BODY
+    shapes.append(
+        dict(
+            type="rect",
+            x0=1, y0=2, x1=9, y1=7,
+            line=dict(width=2),
+            fillcolor="rgba(245,245,245,0.8)",
+        )
+    )
+
+    # ROOF = Generation & storage
+    roof_path = "M 1 7 L 5 9 L 9 7 Z"
+    shapes.append(
+        dict(
+            type="path",
+            path=roof_path,
+            line=dict(width=2),
+            fillcolor="rgba(180, 255, 180, 0.5)",
+        )
+    )
+
+    # Electrical zone (upper half)
+    shapes.append(
+        dict(
+            type="rect",
+            x0=1.05, y0=4.0, x1=8.95, y1=6.95,
+            line=dict(width=1, dash="dot"),
+            fillcolor="rgba(210, 225, 255, 0.4)",
+        )
+    )
+    # Left = fixed
+    shapes.append(
+        dict(
+            type="rect",
+            x0=1.1, y0=4.1, x1=4.8, y1=6.85,
+            line=dict(width=1, dash="dot"),
+            fillcolor="rgba(150, 200, 255, 0.4)",
+        )
+    )
+    # Right = flexible
+    shapes.append(
+        dict(
+            type="rect",
+            x0=5.2, y0=4.1, x1=8.85, y1=6.85,
+            line=dict(width=1, dash="dot"),
+            fillcolor="rgba(255, 235, 170, 0.4)",
+        )
+    )
+
+    # Thermal zone (lower half)
+    shapes.append(
+        dict(
+            type="rect",
+            x0=1.05, y0=2.05, x1=8.95, y1=3.95,
+            line=dict(width=1, dash="dot"),
+            fillcolor="rgba(255, 190, 190, 0.45)",
+        )
+    )
+
+    # EV / outside
+    shapes.append(
+        dict(
+            type="rect",
+            x0=9.2, y0=1.95, x1=10.1, y1=3.02,
+            line=dict(width=1.5),
+            fillcolor="rgba(250,250,250,0.9)",
+        )
+    )
+
+    fig.update_layout(shapes=shapes)
+
+    # ---- base annotations (zone labels) ----
+    annotations = [
+        dict(x=2.0, y=4.3, text="Electrical (fixed)",    showarrow=False, font=dict(size=10)),
+        dict(x=6.2, y=4.3, text="Electrical (flexible)", showarrow=False, font=dict(size=10)),
+        dict(x=1.8, y=2.2, text="Thermal",               showarrow=False, font=dict(size=10)),
+        dict(x=5.0, y=7.2, text="Generation & Storage",  showarrow=False, font=dict(size=11)),
+    ]
+
+    # ---- collect selected devices per zone ----
+    zone_devices = {
+        "elec_fixed": [],
+        "elec_flex":  [],
+        "thermal":    [],
+        "gen_store":  [],
+        "outside":    [],
+    }
+
+    for full_key, checked in sel.items():
+        if not checked:
+            continue
+        if ":" not in full_key:
+            continue
+        cat_key, dev_type = full_key.split(":", 1)
+        if cat_key not in zone_devices:
+            continue
+
+        cfg_current = cfgs.get(full_key, {})
+        label = resolve_display_label(full_key, dev_type, cfg_current)
+        zone_devices[cat_key].append(label)
+
+    # ---- helper: grid layout for zones ----
+    def add_zone_devices_grid(
+        labels,
+        base_x,
+        base_y,
+        max_cols,
+        max_rows,
+        dx,
+        dy,
+    ):
+        capacity = max_cols * max_rows
+        for j, label in enumerate(labels[:capacity]):
+            col = j % max_cols
+            row = j // max_cols
+            x = base_x + col * dx
+            y = base_y - row * dy
+            annotations.append(
+                dict(
+                    x=x,
+                    y=y,
+                    text=extract_icon(label),
+                    showarrow=False,
+                    font=dict(size=11),
+                    bgcolor="rgba(255,255,255,0.9)",
+                    bordercolor="rgba(0,0,0,0.25)",
+                    borderwidth=1,
+                    borderpad=2,
+                    xanchor="center",
+                    yanchor="middle",
+                )
+            )
+
+    # 1) Electrical fixed – 4 x 4 grid
+    add_zone_devices_grid(
+        zone_devices["elec_fixed"],
+        base_x=1.6,
+        base_y=6.5,
+        max_cols=5,
+        max_rows=4,
+        dx=0.68,
+        dy=0.6,
+    )
+
+    # 2) Electrical flexible – 4 x 4 grid
+    add_zone_devices_grid(
+        zone_devices["elec_flex"],
+        base_x=5.65,
+        base_y=6.5,
+        max_cols=5,
+        max_rows=4,
+        dx=0.68,
+        dy=0.6,
+    )
+
+    # 3) Thermal – 4 x 4 grid
+    add_zone_devices_grid(
+        zone_devices["thermal"],
+        base_x=3.0,
+        base_y=3.7,
+        max_cols=4,
+        max_rows=4,
+        dx=1.3,
+        dy=0.45,
+    )
+
+    # 4) Generation & storage – triangular layout (same as old code)
+    gen_slots = [
+        # top row (2)
+        (4.6, 8.4),
+        (5.4, 8.4),
+        # middle row (4)
+        (3.9, 8.0),
+        (4.6, 8.0),
+        (5.4, 8.0),
+        (6.2, 8.0),
+        # bottom row (6)
+        (2.9, 7.5),
+        (3.7, 7.5),
+        (4.5, 7.5),
+        (5.3, 7.5),
+        (6.1, 7.5),
+        (7.0, 7.5),
+    ]
+
+    for j, label in enumerate(zone_devices["gen_store"][: len(gen_slots)]):
+        x, y = gen_slots[j]
+        annotations.append(
+            dict(
+                x=x,
+                y=y,
+                text=extract_icon(label),
+                showarrow=False,
+                font=dict(size=11),
+                bgcolor="rgba(255,255,255,0.9)",
+                bordercolor="rgba(0,0,0,0.25)",
+                borderwidth=1,
+                borderpad=2,
+                xanchor="center",
+                yanchor="middle",
+            )
+        )
+
+    # 5) EV / outside – up to 2 stacked
+    ev_slots = [
+        (9.65, 2.7),
+        (9.65, 2.2),
+    ]
+    for j, label in enumerate(zone_devices["outside"][: len(ev_slots)]):
+        x, y = ev_slots[j]
+        annotations.append(
+            dict(
+                x=x,
+                y=y,
+                text=extract_icon(label),
+                showarrow=False,
+                font=dict(size=11),
+                bgcolor="rgba(255,255,255,0.9)",
+                bordercolor="rgba(0,0,0,0.25)",
+                borderwidth=1,
+                borderpad=2,
+                xanchor="center",
+                yanchor="middle",
+            )
+        )
+
+    fig.update_layout(
+        annotations=annotations,
+        xaxis=dict(visible=False, range=[0, 11]),
+        yaxis=dict(visible=False, range=[0, 10]),
+        margin=dict(l=10, r=10, t=10, b=10),
+        template="plotly_white",
+        autosize=True,
+        height=None,
+    )
+
+    fig.update_yaxes(scaleanchor=None)
+    return fig
+
+def get_house_thermal_params():
+    """Derive UA, C_th and default comfort band from house_info."""
+    hi = st.session_state.get(
+        "house_info",
+        {"size": "Medium house", "insulation": "Average", "residents": 2},
+    )
+    size_str = (hi.get("size") or "Medium house").lower()
+    ins_str  = hi.get("insulation", "Average")
+
+    # base UA + Cth by size
+    if "small" in size_str:
+        ua_base  = 0.10   # kW/°C
+        Cth_base = 0.50   # kWh/°C
+    elif "large" in size_str:
+        ua_base  = 0.14
+        Cth_base = 0.75
+    else:
+        ua_base  = 0.12
+        Cth_base = 0.60
+
+    # insulation
+    if ins_str == "Poor":
+        ua = ua_base * 1.3
+    elif ins_str == "Good":
+        ua = ua_base * 0.7
+    else:
+        ua = ua_base
+
+    # default comfort band (can be edited in UI)
+    t_min_default = 20.0
+    t_max_default = 22.0
+
+    return {
+        "ua_kw_per_c": ua,
+        "C_th_kwh_per_c": Cth_base,
+        "t_min_default": t_min_default,
+        "t_max_default": t_max_default,
+    }
+
+
+
+# -------------------------------------------------------------------
+# Main page function
+# -------------------------------------------------------------------
+def render_devices_page_house():
+
+    st.markdown("### 🏠 House information")
+
+    hi = st.session_state.get("house_info", {
+        "size": "Medium house",
+        "insulation": "Average",
+        "residents": 2,
+    })
+    prev_hi = st.session_state.get("house_info_prev")
+    if prev_hi is None or prev_hi != hi:
+        st.session_state["device_configs"] = {}
+    st.session_state["house_info_prev"] = hi.copy()
+
+
+    # ---- init session dicts ----
+    if "device_selection" not in st.session_state:
+        st.session_state["device_selection"] = {}
+    if "device_configs" not in st.session_state:
+        st.session_state["device_configs"] = {}
+
+    sel = st.session_state["device_selection"]
+    cfgs = st.session_state["device_configs"]
+
+    # ===============================================================
+    # 1) TOP: layout (left) + daily power profiles (right)
+    # ===============================================================
+    top_left, top_right = st.columns([1, 1])
+
+    with top_left:
+        st.markdown("### House layout")
+        layout_placeholder = st.empty()
+
+    with top_right:
+        st.markdown("### Daily power profiles")
+        profile_placeholder = st.empty()
+        
+
+    st.markdown("---")
+
+    # ===============================================================
+    # 2) BOTTOM: device selection – Ninite-style
+    # ===============================================================
+    st.markdown("### Select the devices in your house")
+    # ---------------------------------------------------------------
+    # Shared preferences for ALL flexible loads
+    # ---------------------------------------------------------------
+    flex_prefs = st.session_state.setdefault(
+        "flex_prefs",
+        {
+            "w_cost": 1,
+            "window_mode": "Daytime (08–17)",
+            "earliest": _time(8, 0),
+            "latest":  _time(17, 0),
+            "earliest_custom": _time(7, 0),
+            "latest_custom":   _time(22, 0),
+        },
+    )
+
+
+
+    def render_category(cat_key: str, n_cols: int = 3):
+        info = DEVICE_CATEGORIES[cat_key]
+        st.markdown(f"#### {info['title']}")
+        st.caption(info["help"])
+
+        # ---- Global preference slider for ALL flexible loads ----
+        # ---------- category-level controls for flexible loads ----------
+        if cat_key == "elec_flex":
+            # make sure we always have a dict in session_state
+            default_flex = {
+                "w_cost": 1,
+                "window_mode": "Daytime (08–17)",
+                "earliest": _time(8, 0),
+                "latest":  _time(17, 0),
+                "earliest_custom": _time(7, 0),
+                "latest_custom":   _time(22, 0),
+            }
+            flex_prefs = st.session_state.get("flex_prefs")
+            if not isinstance(flex_prefs, dict):
+                flex_prefs = default_flex.copy()
+                st.session_state["flex_prefs"] = flex_prefs
+
+            with st.expander("⚙️ Flexible load – global settings", expanded=False):
+
+                # --- allowed window presets ---
+                window_options = [
+                    "Any time (00–24)",
+                    "Daytime (08–17)",
+                    "Evening (17–23)",
+                    "Night (00–06)",
+                    "Custom",
+                ]
+                flex_prefs["window_mode"] = st.radio(
+                    "When is it OK to run flexible devices?",
+                    options=window_options,
+                    index=window_options.index(flex_prefs.get("window_mode", "Daytime (08–17)")),
+                    horizontal=False,
+                    key="flex_window_mode",
+                )
+
+                mode = flex_prefs["window_mode"]
+                if mode == "Any time (00–24)":
+                    flex_prefs["earliest"] = _time(0, 0)
+                    flex_prefs["latest"]   = _time(23, 59)
+                elif mode == "Daytime (08–17)":
+                    flex_prefs["earliest"] = _time(8, 0)
+                    flex_prefs["latest"]   = _time(17, 0)
+                elif mode == "Evening (17–23)":
+                    flex_prefs["earliest"] = _time(17, 0)
+                    flex_prefs["latest"]   = _time(23, 0)
+                elif mode == "Night (00–06)":
+                    flex_prefs["earliest"] = _time(0, 0)
+                    flex_prefs["latest"]   = _time(6, 0)
+                elif mode == "Custom":
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        flex_prefs["earliest_custom"] = c1.time_input(
+                            "Earliest allowed start",
+                            value=flex_prefs.get("earliest_custom", _time(7, 0)),
+                            key="flex_earliest_custom",
                         )
-                        # Power
-                        cfg["power_w"] = st.number_input(
-                            "Power (W)",
-                            min_value=0.0,
-                            max_value=5000.0,
-                            step=10.0,
-                            value=float(cfg.get("power_w", 100.0)),
-                            key=f"{settings_id}_power",
+                    with c2:
+                        flex_prefs["latest_custom"] = c2.time_input(
+                            "Latest allowed finish",
+                            value=flex_prefs.get("latest_custom", _time(22, 0)),
+                            key="flex_latest_custom",
                         )
+                    # copy custom to effective window
+                    flex_prefs["earliest"] = flex_prefs["earliest_custom"]
+                    flex_prefs["latest"]   = flex_prefs["latest_custom"]
 
-                        # Intervals (multiple allowed)
-                        st.caption("On/off intervals (you can add multiple):")
-                        intervals = cfg.setdefault("intervals", [])
-                        if not intervals:
-                            intervals.append({"start": _time(18, 0), "end": _time(23, 0)})
+                # --- single preference bar for all flex loads ---
+                flex_prefs["w_cost"] = st.slider(
+                    "Preference (0 = CO₂ only, 1 = cost only)",
+                    min_value=0.0,
+                    max_value=1.0,
+                    step=0.05,
+                    value=float(flex_prefs.get("w_cost", 1)),
+                    key="flex_w_cost",
+                )
 
-                        to_delete = None
-                        for j, iv in enumerate(intervals):
-                            c_a, c_b, c_c = st.columns([0.4, 0.4, 0.2])
-                            with c_a:
-                                s_t = c_a.time_input(
-                                    "Start",
-                                    value=iv.get("start", _time(18, 0)),
-                                    key=f"{settings_id}_start_{j}",
-                                )
-                            with c_b:
-                                e_t = c_b.time_input(
-                                    "End",
-                                    value=iv.get("end", _time(23, 0)),
-                                    key=f"{settings_id}_end_{j}",
-                                )
-                            with c_c:
-                                if c_c.button("🗑", key=f"{settings_id}_ivdel_{j}"):
-                                    to_delete = j
-                            iv["start"], iv["end"] = s_t, e_t
+                cols_pref = st.columns(2)
+                with cols_pref[1]:
+                    if st.button("↩ Reset flexible loads to defaults", key="flex_reset_all"):
+                        new_defaults = default_flex.copy()
+                        st.session_state["flex_prefs"] = new_defaults
+                        flex_prefs = new_defaults
 
-                        if to_delete is not None:
-                            intervals.pop(to_delete)
-                            st.rerun()
+                        cfgs_local = st.session_state.get("device_configs", {})
+                        for full_key in list(cfgs_local.keys()):
+                            if full_key.startswith("elec_flex:"):
+                                dev_type = full_key.split(":", 1)[1]
+                                cfgs_local[full_key] = get_default_config(dev_type, "elec_flex")
+                        st.session_state["device_configs"] = cfgs_local
 
-                        if st.button("➕ Add interval", key=f"{settings_id}_add_interval"):
-                            intervals.append({"start": _time(18, 0), "end": _time(23, 0)})
-                            st.rerun()
+                        st.success("All flexible loads reset to defaults for this house profile.")
+                        st.rerun()
 
-                        # small gap
-                        st.markdown("<div style='height:0.75rem'></div>",
-                                    unsafe_allow_html=True)
-                        
-                        # Profile (scaled by number of devices)
-                        st.markdown("**Daily load profile (preview)**")
-                        prof = build_minute_profile(
-                            power_w=cfg["power_w"] * cfg["num_devices"],
-                            intervals=intervals,
-                            step_min=1,
-                        )
-                        cfg["profile_index"] = prof.index.astype(str).tolist()
-                        cfg["profile_kw"]    = prof.values.tolist()
+                with cols_pref[0]:
+                    if st.button("💡 Suggest schedules for all flexible devices",
+                                key="flex_suggest_all"):
+                        flex_prefs = st.session_state.get("flex_prefs", {})
+                        cfgs_local = st.session_state.get("device_configs", {})
 
-                        fig_p = go.Figure()
-                        fig_p.add_scatter(
-                            x=prof.index,
-                            y=prof.values,
-                            mode="lines",
-                            name="P_flex_total_kW",
-                        )
-                        fig_p.update_layout(
-                            height=180,
-                            margin=dict(l=10, r=10, t=10, b=8),
-                            xaxis_title="Time",
-                            yaxis_title="kW",
-                            showlegend=False,
-                        )
-                        st.plotly_chart(fig_p, use_container_width=True)
+                        any_updated = False
+                        for full_key, cfg in cfgs_local.items():
+                            if not full_key.startswith("elec_flex:"):
+                                continue
+                            dev_type = full_key.split(":", 1)[1]
 
-                        if st.button("▲ Hide details", key=f"{settings_id}_hide_flex"):
-                            st.session_state[f"settings_open_{settings_id}"] = False
-                            st.rerun()
+                            # ensure we have a config
+                            if cfg is None or "duration_min" not in cfg:
+                                cfg = get_default_config(dev_type, "elec_flex")
 
-                        
-
-                    # ---------- FLEXIBLE ELECTRICAL LOADS ----------
-                    elif cat_key == "elec_flex":
-                        # Number of identical devices
-                        cfg["num_devices"] = int(
-                            st.number_input(
-                                "Number of devices",
-                                min_value=1,
-                                max_value=10,
-                                step=1,
-                                value=int(cfg.get("num_devices", 1)),
-                                key=f"{settings_id}_numdev",
-                            )
-                        )
-
-                        # Power when ON
-                        cfg["power_w"] = st.number_input(
-                            "Power per device (W)",
-                            min_value=0.0,
-                            max_value=5000.0,
-                            step=50.0,
-                            value=float(cfg.get("power_w", 1200.0)),
-                            key=f"{settings_id}_power_flex",
-                        )
-
-                        # Total ON duration
-                        cfg["duration_min"] = int(
-                            st.number_input(
-                                "Operation duration (minutes)",
-                                min_value=15,
-                                max_value=600,
-                                step=15,
-                                value=int(cfg.get("duration_min", 90)),
-                                key=f"{settings_id}_dur",
-                            )
-                        )
-
-                        # cost vs CO2 preference
-                        cfg["w_cost"] = float(
-                            st.slider(
-                                "Preference (0 = CO₂ only, 1 = cost only)",
-                                min_value=0.0,
-                                max_value=1.0,
-                                step=0.05,
-                                value=float(cfg.get("w_cost", 0.5)),
-                                key=f"{settings_id}_w_cost",
-                            )
-                        )
-
-                        # Make sure we have exactly one interval in cfg
-                        intervals = cfg.setdefault("intervals", [])
-                        if not intervals:
-                            intervals.append(
-                                {"start": _time(20, 0), "end": _time(21, 30)}
-                            )
-                        elif len(intervals) > 1:
-                            intervals[:] = intervals[:1]
-
-                        current_iv = intervals[0]
-
-                        st.caption("Current scheduled interval (kept as one continuous block):")
-                        c_a, c_b = st.columns(2)
-                        with c_a:
-                            new_start = c_a.time_input(
-                                "Start",
-                                value=current_iv.get("start", _time(20, 0)),
-                                key=f"{settings_id}_flex_start",
-                            )
-                        with c_b:
-                            new_end = c_b.time_input(
-                                "End",
-                                value=current_iv.get("end", _time(21, 30)),
-                                key=f"{settings_id}_flex_end",
-                            )
-                        current_iv["start"], current_iv["end"] = new_start, new_end
-
-                        # Suggest button
-                        if st.button("💡 Suggest schedule from price/CO₂",
-                                key=f"{settings_id}_suggest"):
+                            duration = int(cfg.get("duration_min", 60))
                             interval = suggest_best_interval_for_day(
-                                duration_min=cfg["duration_min"],
-                                w_cost=cfg["w_cost"],
+                                duration_min=duration,
+                                w_cost=flex_prefs.get("w_cost", 0.5),
+                                earliest=flex_prefs.get("earliest"),
+                                latest=flex_prefs.get("latest"),
                             )
                             if interval is None:
-                                st.warning(
-                                    "No price/CO₂ data or no selected day. "
-                                    "Please select a day and fetch data first."
-                                )
+                                continue
+
+                            cfg["intervals"] = [interval]
+
+                            # update preview profile
+                            num_devices = int(cfg.get("num_devices", 1))
+                            power_w     = float(
+                                cfg.get("power_w", cfg.get("power_kw", 0.5) * 1000.0)
+                            )
+                            prof = build_minute_profile(
+                                power_w=power_w * num_devices,
+                                intervals=cfg["intervals"],
+                                step_min=1,
+                            )
+                            cfg["profile_index"] = prof.index.astype(str).tolist()
+                            cfg["profile_kw"]    = prof.values.tolist()
+
+                            cfgs_local[full_key] = cfg
+                            any_updated = True
+
+                        if any_updated:
+                            st.session_state["device_configs"] = cfgs_local
+                            st.success("All flexible device schedules were updated.")
+                            st.rerun()
+                        else:
+                            st.info("No flexible devices are configured yet, or no price/CO₂ data.")
+                
+                st.markdown("##### 📋 Flexible devices – schedule overview")
+                rows = []
+                for dev_type, label in DEVICE_CATEGORIES["elec_flex"]["devices"]:
+                    full_key = f"elec_flex:{dev_type}"
+
+                    # only show selected devices
+                    if not sel.get(full_key, False):
+                        continue
+
+                    cfg = cfgs.get(full_key, {})
+                    if not cfg:
+                        continue
+
+                    # resolve display name (respect custom name for "other_flex_*")
+                    display_label = label
+                    if dev_type.startswith("other"):
+                        custom_name = cfg.get("custom_name")
+                        if custom_name:
+                            # keep emoji, change text
+                            if " " in label:
+                                emoji = label.split(" ", 1)[0]
                             else:
-                                intervals[0] = interval
-                                st.success(
-                                    f"Suggested interval: {interval['start'].strftime('%H:%M')}–"
-                                    f"{interval['end'].strftime('%H:%M')}"
+                                emoji = "🧩"
+                            display_label = f"{emoji} {custom_name}"
+
+                    intervals = cfg.get("intervals") or []
+                    if not intervals:
+                        continue
+
+                    # join intervals as "HH:MM–HH:MM, ..."
+                    def _fmt_t(t):
+                        return t.strftime("%H:%M") if t is not None else "--:--"
+
+                    interval_strs = [
+                        f"{_fmt_t(iv.get('start'))}–{_fmt_t(iv.get('end'))}"
+                        for iv in intervals
+                    ]
+                    interval_txt = ", ".join(interval_strs)
+
+                    num_devices = int(cfg.get("num_devices", 1))
+                    dur_min = int(cfg.get("duration_min", 0))
+
+                    rows.append(
+                        {
+                            "Device": display_label,
+                            "# units": num_devices,
+                            "Duration (min)": dur_min,
+                            "Scheduled time(s)": interval_txt,
+                        }
+                    )
+
+                if rows:
+                    df_overview = pd.DataFrame(rows)
+                    st.dataframe(
+                        df_overview,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.caption("No flexible devices selected yet, or no schedules defined.")
+
+            st.session_state["flex_prefs"] = flex_prefs
+
+        # ---------- Thermal: shared house model + helpers ----------
+        if cat_key == "thermal":
+            hpar = get_house_thermal_params()
+            ua_base   = hpar["ua_kw_per_c"]
+            Cth_base  = hpar["C_th_kwh_per_c"]
+            tmin_def  = hpar["t_min_default"]
+            tmax_def  = hpar["t_max_default"]
+
+            # store for later use if needed elsewhere
+            st.session_state["thermal_house_params"] = hpar
+
+
+            def _get_outdoor_profile():
+                if (
+                    "temp_daily" in st.session_state
+                    and isinstance(st.session_state["temp_daily"], pd.Series)
+                    and not st.session_state["temp_daily"].empty
+                ):
+                    tout_tot = st.session_state["temp_daily"]
+                    tout_minute = get_selected_day_data(tout_tot)
+                    idx = tout_minute.index
+                else:
+                    idx = pd.date_range("2025-01-10 00:00", periods=24 * 60, freq="min")
+                    hours = idx.hour + idx.minute / 60.0
+                    tout_minute = pd.Series(
+                        5.0 + 5.0 * np.sin(2 * np.pi * (hours - 15) / 24.0),
+                        index=idx,
+                        name="Tout_C",
+                    )
+                return idx, tout_minute
+
+
+        devs = info["devices"]
+        cols = st.columns(n_cols)
+
+        for i, (dev_type, label) in enumerate(devs):
+            col = cols[i % n_cols]
+            with col:
+                full_key   = f"{cat_key}:{dev_type}"
+                open_key   = f"open_cfg_{full_key}"
+                settings_id = full_key.replace(":", "_")
+
+                # get current cfg (for custom name)
+                cfg_current = cfgs.get(full_key, {})
+
+                # --------- build dynamic label (for "other*" types) ----------
+                display_label = resolve_display_label(full_key, dev_type, cfg_current)
+        
+                c1, c2 = st.columns([0.8, 0.2])
+
+                with c1:
+                    default_on = False
+                    checked = st.checkbox(
+                        display_label,
+                        value=sel.get(full_key, default_on),
+                        key=f"chk_{full_key}",
+                    )
+                    sel[full_key] = checked
+                if checked and full_key not in cfgs and cat_key in ("elec_fixed", "elec_flex"):
+                    cfgs[full_key] = get_default_config(dev_type, cat_key)    
+
+                with c2:
+                    if st.button("⚙️", key=f"cfg_{full_key}"):
+                        st.session_state[open_key] = not st.session_state.get(open_key, False)
+                        st.rerun()
+
+                # --- settings panel (only when opened) ---
+                if st.session_state.get(open_key, False):
+                    cfg = cfgs.get(full_key)
+                    if cfg is None:
+                        cfg = get_default_config(dev_type, cat_key)
+                        cfgs[full_key] = cfg
+
+                    # --- Custom name for “other*” devices ---
+                    if dev_type.startswith("other"):
+                        base_label = label
+                        if " " in label:
+                            base_label = label.split(" ", 1)[1]
+                        cfg["custom_name"] = st.text_input(
+                            "Name of this device",
+                            value=cfg.get("custom_name", base_label),
+                            key=f"name_{full_key}",
+                            help="E.g. '3D printer', 'Aquarium pump', 'Server rack', etc.",
+                        )
+
+                    st.write("")  # small gap
+
+                    # =======================================================
+                    # A) Detailed editor for FIXED ELECTRICAL loads
+                    # =======================================================
+                    if cat_key == "elec_fixed":
+                        with st.container():
+                            st.markdown(
+                                "<hr style='border-top: 1px dashed #bbb;'/>",
+                                unsafe_allow_html=True,
+                            )
+
+                            # Number of identical devices
+                            cfg["num_devices"] = int(
+                                st.number_input(
+                                    "Number of devices",
+                                    min_value=1,
+                                    max_value=30,
+                                    step=1,
+                                    value=int(cfg.get("num_devices", 1)),
+                                    key=f"{settings_id}_numdev",
                                 )
+                            )
+
+                            # Power per device (W)
+                            # fall back to power_kw if power_w not set yet
+                            default_power_w = float(
+                                cfg.get("power_w", cfg.get("power_kw", 0.1) * 1000.0)
+                            )
+                            cfg["power_w"] = st.number_input(
+                                "Power per device (W)",
+                                min_value=0.0,
+                                max_value=5000.0,
+                                step=10.0,
+                                value=default_power_w,
+                                key=f"{settings_id}_power",
+                            )
+                            # keep power_kw in sync (for later use if needed)
+                            cfg["power_kw"] = cfg["power_w"] / 1000.0
+
+                            # Intervals (multiple allowed)
+                            st.caption("On/off intervals (you can add multiple):")
+                            intervals = cfg.setdefault("intervals", [])
+                            if not intervals:
+                                intervals.append({"start": _time(18, 0), "end": _time(23, 0)})
+
+                            to_delete = None
+                            for j, iv in enumerate(intervals):
+                                c_a, c_b, c_c = st.columns([0.4, 0.4, 0.2])
+                                with c_a:
+                                    s_t = st.time_input(
+                                        "Start",
+                                        value=iv.get("start", _time(18, 0)),
+                                        key=f"{settings_id}_start_{j}",
+                                    )
+                                with c_b:
+                                    e_t = st.time_input(
+                                        "End",
+                                        value=iv.get("end", _time(23, 0)),
+                                        key=f"{settings_id}_end_{j}",
+                                    )
+                                with c_c:
+                                    if st.button("🗑", key=f"{settings_id}_ivdel_{j}"):
+                                        to_delete = j
+                                iv["start"], iv["end"] = s_t, e_t
+
+                            if to_delete is not None:
+                                intervals.pop(to_delete)
                                 st.rerun()
 
+                            if st.button("➕ Add interval", key=f"{settings_id}_add_interval"):
+                                intervals.append({"start": _time(18, 0), "end": _time(23, 0)})
+                                st.rerun()
 
-                        # Profile (scaled by number of devices)
-                        st.markdown("**Daily load profile (preview)**")
-                        prof = build_minute_profile(
-                            power_w=cfg["power_w"] * cfg["num_devices"],
-                            intervals=intervals,
-                            step_min=1,
-                        )
-                        cfg["profile_index"] = prof.index.astype(str).tolist()
-                        cfg["profile_kw"]    = prof.values.tolist()
+                            # small gap
+                            st.markdown("<div style='height:0.5rem'></div>",
+                                        unsafe_allow_html=True)
 
-                        fig_p = go.Figure()
-                        fig_p.add_scatter(
-                            x=prof.index,
-                            y=prof.values,
-                            mode="lines",
-                            name="P_flex_total_kW",
-                        )
-                        fig_p.update_layout(
-                            height=180,
-                            margin=dict(l=10, r=10, t=10, b=8),
-                            xaxis_title="Time",
-                            yaxis_title="kW",
-                            showlegend=False,
-                        )
-                        st.plotly_chart(fig_p, use_container_width=True)
+                            # Profile (scaled by number of devices)
+                            st.markdown("**Daily load profile (preview)**")
 
-                        if st.button("▲ Hide details", key=f"{settings_id}_hide_flex"):
-                            st.session_state[f"settings_open_{settings_id}"] = False
-                            st.rerun()
-                                        
-                    # 2) Heat pump in thermal category: user-friendly inputs only
-                    elif cat_key == "thermal" and dev["type"] == "hp":
-                        st.markdown(
-                            """
-                            <hr style="border: 0; border-top: 1px dotted #fecaca; margin: 0.4rem 0;" />
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-                        st.markdown("**Heat pump comfort & house settings**")
-
-                        # --- Comfort band ---
-                        c_tmin, c_tmax = st.columns(2)
-                        cfg["t_min_c"] = c_tmin.number_input(
-                            "Min indoor temperature (°C)",
-                            min_value=5.0,
-                            max_value=30.0,
-                            step=0.5,
-                            value=float(cfg.get("t_min_c", 20.0)),
-                            key=f"{settings_id}_tmin",
-                        )
-                        cfg["t_max_c"] = c_tmax.number_input(
-                            "Max indoor temperature (°C)",
-                            min_value=5.0,
-                            max_value=30.0,
-                            step=0.5,
-                            value=float(cfg.get("t_max_c", 22.0)),
-                            key=f"{settings_id}_tmax",
-                        )
-                        if cfg["t_max_c"] < cfg["t_min_c"]:
-                            cfg["t_max_c"] = cfg["t_min_c"]
-
-                        # --- Qualitative building info ---
-                        c_size, c_ins = st.columns(2)
-                        cfg["house_size"] = c_size.selectbox(
-                            "House size",
-                            ["Small apartment", "Medium house", "Large house"],
-                            index=["Small apartment", "Medium house", "Large house"].index(
-                                cfg.get("house_size", "Medium house")
-                            ),
-                            key=f"{settings_id}_hsize",
-                        )
-                        
-                        cfg["insulation"] = c_ins.selectbox(
-                            "Insulation level",
-                            ["Poor", "Average", "Good"],
-                            index=["Poor", "Average", "Good"].index(
-                                cfg.get("insulation", "Average")
-                            ),
-                            key=f"{settings_id}_insul",
-                        )
-
-                        # --- Map qualitative choices to ua & q_rated ---
-                        # --- Map qualitative choices to ua & suggested q_rated ---
-                        size = cfg["house_size"]
-                        ins  = cfg["insulation"]
-
-                        # base UA & capacity guess by size
-                        if size == "Small apartment":
-                            ua_base = 0.10   # kW/°C
-                            q_guess = 4.0    # kW
-                            Cth_guess = 0.50   # kWh/°C
-                        elif size == "Large house":
-                            ua_base = 0.14
-                            q_guess = 8.0
-                            Cth_guess = 0.75  # kWh/°C
-                        else:  # "Medium house"
-                            ua_base = 0.12
-                            q_guess = 6.0
-                            Cth_guess = 0.60
-
-                        # adjust UA by insulation
-                        if ins == "Poor":
-                            ua = ua_base * 1.3
-                        elif ins == "Good":
-                            ua = ua_base * 0.7
-                        else:
-                            ua = ua_base
-
-                        # --- Let the user override the capacity ---
-                        cfg["q_rated_kw"] = st.number_input(
-                            "Heat pump capacity (kW)",
-                            min_value=1.0,
-                            max_value=30.0,
-                            step=0.5,
-                            value=float(cfg.get("q_rated_kw", q_guess)),
-                            key=f"{settings_id}_q_rated",
-                        )
-
-                        q_rated = float(cfg["q_rated_kw"])
-
-
-                        # thermostat parameters
-                        t_min = float(cfg["t_min_c"])
-                        t_max = float(cfg["t_max_c"])
-                        t_set = 0.5 * (t_min + t_max)
-                        hyst  = max(t_max - t_min, 0.5)
-
-                        # --- Get outdoor temperature from page 1, or fallback ---
-                        if (
-                            "temp_daily" in st.session_state
-                            and isinstance(st.session_state["temp_daily"], pd.Series)
-                            and not st.session_state["temp_daily"].empty
-                        ):
-                            tout_tot = st.session_state["temp_daily"]
-                            tout_minute=get_selected_day_data(tout_tot)
-                            
-                            idx_hp = tout_minute.index
-                            st.caption("Using fetched outdoor temperature for this preview.")
-                        else:
-                            idx_hp = pd.date_range(
-                                "2025-01-10 00:00", periods=24 * 60, freq="min"
+                            prof = build_minute_profile(
+                                power_w=cfg["power_w"] * cfg["num_devices"],
+                                intervals=intervals,
+                                step_min=1,
                             )
-                            hours = idx_hp.hour + idx_hp.minute / 60.0
-                            tout_minute = pd.Series(
-                                5.0 + 5.0 * np.sin(2 * np.pi * (hours - 15) / 24.0),
-                                index=idx_hp,
-                                name="Tout_C",
+                            cfg["profile_index"] = prof.index.astype(str).tolist()
+                            cfg["profile_kw"]    = prof.values.tolist()
+
+                            fig_p = go.Figure()
+                            fig_p.add_scatter(
+                                x=prof.index,
+                                y=prof.values,
+                                mode="lines",
+                                name="P_fixed_total_kW",
                             )
-                            st.caption(
-                                "No weather data found, using a synthetic outdoor temperature profile."
+                            fig_p.update_layout(
+                                height=180,
+                                margin=dict(l=10, r=10, t=8, b=8),
+                                xaxis_title="Time",
+                                yaxis_title="kW",
+                                showlegend=False,
+                            )
+                            st.plotly_chart(fig_p, use_container_width=True)
+
+                            if st.button("▲ Hide", key=f"hide_{full_key}"):
+                                st.session_state[open_key] = False
+                                st.rerun()
+
+                            st.markdown("</div>", unsafe_allow_html=True)
+
+                    # =======================================================
+                    # B) Detailed editor for FLEXIBLE ELECTRICAL loads
+                    #    (single shiftable block + preference + suggest button)
+                    # =======================================================
+                    elif cat_key == "elec_flex":
+                        with st.container():
+                            st.markdown(
+                                "<hr style='border-top: 1px dashed #bbb;'/>",
+                                unsafe_allow_html=True,
                             )
 
-                        # --- Build HP model with derived parameters ---
-                        hp = WeatherHP(
-                            ua_kw_per_c=float(ua),
-                            t_set_c=t_set,
-                            q_rated_kw=float(q_rated),
-                            cop_at_7c=3.2,
-                            cop_min=1.6,
-                            cop_max=4.2,
-                            C_th_kwh_per_c=float(Cth_guess),
-                            hyst_band_c=hyst,
-                            p_off_kw=0.05,     # 50 W standby
-                            defrost=True,
-                            min_on_min=0,
-                            min_off_min=0,
-                            Ti0_c=t_set,
-                        )
-                        p_hp = hp.series_kw(idx_hp, tout_minute)
-                        cfg["profile_index"] = p_hp.index.astype(str).tolist()
-                        cfg["profile_kw"]    = p_hp.values.tolist()
-
-
-                        
-
-                        # --- Plot HP electrical power ---
-                        fig_hp = go.Figure()
-                        fig_hp.add_scatter(
-                            x=p_hp.index,
-                            y=p_hp.values,
-                            mode="lines",
-                            name="P_HP_kW",
-                        )
-                        # small gap
-                        st.markdown("<div style='height:0.75rem'></div>",
-                                    unsafe_allow_html=True)
-                        st.markdown("**Heat pump electrical power (preview)**")
-                        fig_hp.update_layout(
-                            height=180,
-                            margin=dict(l=10, r=10, t=10, b=8),
-                            xaxis_title="Time",
-                            yaxis_title="kW",
-                            showlegend=False,
-                        )
-                        st.plotly_chart(fig_hp, use_container_width=True)
-
-                        if st.button("▲ Hide details", key=f"{settings_id}_hide_hp"):
-                            st.session_state[f"settings_open_{settings_id}"] = False
-                            st.rerun()
-
-                    # 3) EL heater in thermal category: user-friendly inputs only
-                    elif cat_key == "thermal" and dev["type"] == "e_heater":
-                        st.markdown(
-                            """
-                            <hr style="border: 0; border-top: 1px dotted #fecaca; margin: 0.4rem 0;" />
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-                        st.markdown("**E Heater comfort & house settings**")
-
-                        # --- Comfort band ---
-                        c_tmin, c_tmax = st.columns(2)
-                        cfg["t_min_c"] = c_tmin.number_input(
-                            "Min indoor temperature (°C)",
-                            min_value=5.0,
-                            max_value=30.0,
-                            step=0.5,
-                            value=float(cfg.get("t_min_c", 20.0)),
-                            key=f"{settings_id}_tmin_eh",   # <<< changed key (added _eh)
-                        )
-                        cfg["t_max_c"] = c_tmax.number_input(
-                            "Max indoor temperature (°C)",
-                            min_value=5.0,
-                            max_value=30.0,
-                            step=0.5,
-                            value=float(cfg.get("t_max_c", 22.0)),
-                            key=f"{settings_id}_tmax_eh",   # <<< changed key (added _eh)
-                        )
-                        if cfg["t_max_c"] < cfg["t_min_c"]:
-                            cfg["t_max_c"] = cfg["t_min_c"]
-
-                        # --- Qualitative building info ---
-                        c_size, c_ins = st.columns(2)
-                        cfg["house_size"] = c_size.selectbox(
-                            "House size",
-                            ["Small apartment", "Medium house", "Large house"],
-                            index=["Small apartment", "Medium house", "Large house"].index(
-                                cfg.get("house_size", "Medium house")
-                            ),
-                            key=f"{settings_id}_hsize_eh",   # <<< changed key (added _eh)
-                        )
-                        cfg["insulation"] = c_ins.selectbox(
-                            "Insulation level",
-                            ["Poor", "Average", "Good"],
-                            index=["Poor", "Average", "Good"].index(
-                                cfg.get("insulation", "Average")
-                            ),
-                            key=f"{settings_id}_insul_eh",   # <<< changed key (added _eh)
-                        )
-
-                        # --- Map qualitative choices to ua & suggested q_rated ---
-                        size = cfg["house_size"]
-                        ins  = cfg["insulation"]
-
-                        # base UA & capacity guess by size
-                        if size == "Small apartment":
-                            ua_base = 0.10   # kW/°C
-                            q_guess = 4.0    # kW
-                            Cth_guess = 0.50   # kWh/°C
-                        elif size == "Large house":
-                            ua_base = 0.14
-                            q_guess = 8.0
-                            Cth_guess = 0.75  # kWh/°C
-                        else:  # "Medium house"
-                            ua_base = 0.12
-                            q_guess = 6.0
-                            Cth_guess = 0.60
-
-                        # adjust UA by insulation
-                        if ins == "Poor":
-                            ua = ua_base * 1.3
-                        elif ins == "Good":
-                            ua = ua_base * 0.7
-                        else:
-                            ua = ua_base
-
-                        # --- Let the user override the capacity ---
-                        cfg["q_rated_kw"] = st.number_input(
-                            "E Heater capacity (kW)",
-                            min_value=1.0,
-                            max_value=30.0,
-                            step=0.5,
-                            value=float(cfg.get("q_rated_kw", q_guess)),
-                            key=f"{settings_id}_q_rated_eh",   # <<< changed key (added _eh)
-                        )
-
-                        q_rated = float(cfg["q_rated_kw"])
-
-                        # thermostat parameters
-                        t_min = float(cfg["t_min_c"])
-                        t_max = float(cfg["t_max_c"])
-                        t_set = 0.5 * (t_min + t_max)
-                        hyst  = max(t_max - t_min, 0.5)
-
-                        # --- Get outdoor temperature from page 1, or fallback ---
-                        if (
-                            "temp_daily" in st.session_state
-                            and isinstance(st.session_state["temp_daily"], pd.Series)
-                            and not st.session_state["temp_daily"].empty
-                        ):
-                            tout_tot = st.session_state["temp_daily"]
-                            tout_minute=get_selected_day_data(tout_tot)
-                            idx_hp = tout_minute.index
-                            st.caption("Using fetched outdoor temperature for this preview.")
-                        else:
-                            idx_hp = pd.date_range(
-                                "2025-01-10 00:00", periods=24 * 60, freq="min"
-                            )
-                            hours = idx_hp.hour + idx_hp.minute / 60.0
-                            tout_minute = pd.Series(
-                                5.0 + 5.0 * np.sin(2 * np.pi * (hours - 15) / 24.0),
-                                index=idx_hp,
-                                name="Tout_C",
-                            )
-                            st.caption(
-                                "No weather data found, using a synthetic outdoor temperature profile."
-                            )
-
-                        # --- Build EL-heater model with derived parameters ---
-                        eh = WeatherELheater(
-                            ua_kw_per_c=float(ua),
-                            t_set_c=t_set,
-                            q_rated_kw=float(q_rated),
-                            C_th_kwh_per_c=float(Cth_guess),
-                            hyst_band_c=hyst,
-                            p_off_kw=0.05,     # 50 W standby
-                            min_on_min=0,
-                            min_off_min=0,
-                            Ti0_c=t_set,
-                        )
-                        p_eh = eh.series_kw(idx_hp, tout_minute)
-                        cfg["profile_index"] = p_eh.index.astype(str).tolist()
-                        cfg["profile_kw"]    = p_eh.values.tolist()
-
-                        # --- Plot E-heater electrical power ---
-                        fig_Ehp = go.Figure()
-                        fig_Ehp.add_scatter(
-                            x=p_eh.index,
-                            y=p_eh.values,
-                            mode="lines",
-                            name="P_EH_kW",
-                        )
-                        st.markdown("<div style='height:0.75rem'></div>", unsafe_allow_html=True)
-                        st.markdown("**E Heater electrical power (preview)**")
-                        fig_Ehp.update_layout(
-                            height=180,
-                            margin=dict(l=10, r=10, t=10, b=8),
-                            xaxis_title="Time",
-                            yaxis_title="kW",
-                            showlegend=False,
-                        )
-                        st.plotly_chart(fig_Ehp, use_container_width=True)
-
-                        if st.button("▲ Hide details", key=f"{settings_id}_hide_eh"):  # <<< changed key
-                            st.session_state[f"settings_open_{settings_id}"] = False
-                            st.rerun()
-
-                    # 4) Hot tub in thermal category
-                    elif cat_key == "thermal" and dev["type"] == "hot_tub":
-                        st.markdown(
-                            """
-                            <hr style="border: 0; border-top: 1px dotted #fecaca; margin: 0.4rem 0;" />
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-                        st.markdown("**Hot tub comfort & usage settings**")
-
-                        # ---- Basic temperature settings ----
-                        c_tgt, c_idle = st.columns(2)
-                        cfg["target_c"] = c_tgt.number_input(
-                            "Target water temperature (°C)",
-                            min_value=25.0,
-                            max_value=45.0,
-                            step=0.5,
-                            value=float(cfg.get("target_c", 40.0)),
-                            key=f"{settings_id}_ht_Ttarget",
-                        )
-                        cfg["idle_c"] = c_idle.number_input(
-                            "Idle temperature (°C)",
-                            min_value=10.0,
-                            max_value=40.0,
-                            step=0.5,
-                            value=float(cfg.get("idle_c", 30.0)),
-                            key=f"{settings_id}_ht_Tidle",
-                        )
-                        if cfg["idle_c"] > cfg["target_c"]:
-                            cfg["idle_c"] = cfg["target_c"]
-
-                        # ---- Water volume & heater size ----
-                        c_vol, c_pow = st.columns(2)
-                        cfg["water_l"] = c_vol.number_input(
-                            "Water volume (L)",
-                            min_value=400.0,
-                            max_value=3000.0,
-                            step=50.0,
-                            value=float(cfg.get("water_l", 1200.0)),
-                            key=f"{settings_id}_ht_vol",
-                        )
-                        cfg["heater_kw"] = c_pow.number_input(
-                            "Heater capacity (kW)",
-                            min_value=1.0,
-                            max_value=12.0,
-                            step=0.5,
-                            value=float(cfg.get("heater_kw", 3.0)),
-                            key=f"{settings_id}_ht_kw",
-                        )
-
-                        # Optional: number of identical hot tubs (very rarely >1, but keep general)
-                        cfg["num_units"] = st.number_input(
-                            "Number of identical hot tubs",
-                            min_value=1,
-                            max_value=5,
-                            step=1,
-                            value=int(cfg.get("num_units", 1)),
-                            key=f"{settings_id}_ht_nunits",
-                        )
-
-                        # ---- Insulation level → UA ----
-                        ins_levels = ["Good cover", "Average", "Poor"]
-                        cfg["insulation_ht"] = st.selectbox(
-                            "Cover / insulation level",
-                            ins_levels,
-                            index=ins_levels.index(cfg.get("insulation_ht", "Average")),
-                            key=f"{settings_id}_ht_ins",
-                        )
-
-                        ins = cfg["insulation_ht"]
-                        ua_base = 0.07  # kW/°C for "Average"
-                        if ins == "Good cover":
-                            ua = ua_base * 0.6
-                        elif ins == "Poor":
-                            ua = ua_base * 1.4
-                        else:
-                            ua = ua_base
-
-                        # ---- Use sessions (start + duration) ----
-                        st.markdown("**Use sessions (hot tub in use)**")
-                        sessions = cfg.setdefault(
-                            "sessions",
-                            [{"start": _time(20, 0), "duration_min": 60}],
-                        )
-
-                        del_idx = None
-                        for j, sess in enumerate(sessions):
-                            c_s, c_d, c_del = st.columns([0.4, 0.4, 0.2])
-                            with c_s:
-                                s_t = c_s.time_input(
-                                    "Start",
-                                    value=sess.get("start", _time(20, 0)),
-                                    key=f"{settings_id}_ht_s_{j}",
+                            # Number of identical devices
+                            cfg["num_devices"] = int(
+                                st.number_input(
+                                    "Number of devices",
+                                    min_value=1,
+                                    max_value=10,
+                                    step=1,
+                                    value=int(cfg.get("num_devices", 1)),
+                                    key=f"{settings_id}_numdev",
                                 )
-                            with c_d:
-                                dur = c_d.number_input(
-                                    "Duration (min)",
+                            )
+
+                            # Power when ON
+                            cfg["power_w"] = st.number_input(
+                                "Power per device (W)",
+                                min_value=0.0,
+                                max_value=5000.0,
+                                step=50.0,
+                                value=float(cfg.get("power_w", 1200.0)),
+                                key=f"{settings_id}_power_flex",
+                            )
+                            cfg["power_kw"] = cfg["power_w"] / 1000.0
+
+                            # Total ON duration
+                            cfg["duration_min"] = int(
+                                st.number_input(
+                                    "Operation duration (minutes)",
                                     min_value=15,
                                     max_value=600,
                                     step=15,
-                                    value=int(sess.get("duration_min", 60)),
-                                    key=f"{settings_id}_ht_d_{j}",
+                                    value=int(cfg.get("duration_min", 90)),
+                                    key=f"{settings_id}_dur",
                                 )
-                            with c_del:
-                                if c_del.button("🗑", key=f"{settings_id}_ht_del_{j}"):
-                                    del_idx = j
-                            sess["start"] = s_t
-                            sess["duration_min"] = dur
-
-                        if del_idx is not None:
-                            sessions.pop(del_idx)
-                            st.rerun()
-
-                        if st.button("➕ Add use session", key=f"{settings_id}_ht_add"):
-                            sessions.append(
-                                {"start": _time(19, 0), "duration_min": 60}
-                            )
-                            st.rerun()
-
-                        # ---- Get outdoor temperature for this day (same logic as HP) ----
-                        if (
-                            "temp_daily" in st.session_state
-                            and isinstance(st.session_state["temp_daily"], pd.Series)
-                            and not st.session_state["temp_daily"].empty
-                        ):
-                            tout_tot = st.session_state["temp_daily"]
-                            # You already have this helper in the HP code:
-                            tout_minute = get_selected_day_data(tout_tot)
-                            idx_ht = tout_minute.index
-                            st.caption("Using fetched outdoor temperature for this preview.")
-                        else:
-                            idx_ht = pd.date_range(
-                                "2025-01-10 00:00", periods=24 * 60, freq="min"
-                            )
-                            hours = idx_ht.hour + idx_ht.minute / 60.0
-                            tout_minute = pd.Series(
-                                5.0 + 5.0 * np.sin(2 * np.pi * (hours - 15) / 24.0),
-                                index=idx_ht,
-                                name="Tout_C",
-                            )
-                            st.caption(
-                                "No weather data found, using a synthetic outdoor temperature profile."
                             )
 
-                        # ---- Simulate hot tub electrical power ----
-                        ht = WeatherHotTub(
-                            target_c=float(cfg["target_c"]),
-                            idle_c=float(cfg["idle_c"]),
-                            heater_kw=float(cfg["heater_kw"]),
-                            water_l=float(cfg["water_l"]),
-                            ua_kw_per_c=float(ua),
-                            sessions=sessions,
-                        )
-                        p_ht_single= ht.series_kw(idx_ht, tout_minute)
-                        p_ht = cfg["num_units"] * p_ht_single
-                        cfg["profile_index"] = p_ht.index.astype(str).tolist()
-                        cfg["profile_kw"]    = p_ht.values.tolist()
-
-                        # ---- Plot ----
-                        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-                        st.markdown("**Hot tub electrical power (preview)**")
-
-                        fig_ht = go.Figure()
-                        fig_ht.add_scatter(
-                            x=p_ht.index,
-                            y=p_ht.values,
-                            mode="lines",
-                            name="P_hot_tub_kW",
-                        )
-                        fig_ht.update_layout(
-                            height=180,
-                            margin=dict(l=10, r=10, t=10, b=8),
-                            xaxis_title="Time",
-                            yaxis_title="kW",
-                            showlegend=False,
-                        )
-                        st.plotly_chart(fig_ht, use_container_width=True)
-
-                        if st.button("▲ Hide details", key=f"{settings_id}_hide_ht"):
-                            st.session_state[f"settings_open_{settings_id}"] = False
-                            st.rerun()
-
-                    # 4) DHW tank in thermal category
-                    elif cat_key == "thermal" and dev["type"] == "dhw":
-                        st.markdown(
-                            """
-                            <hr style="border: 0; border-top: 1px dotted #fecaca; margin: 0.4rem 0;" />
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-                        st.markdown("**DHW tank settings**")
-
-                        # --- Tank volume & usage ---
-                        c_vol, c_use = st.columns(2)
-                        cfg["volume_l"] = c_vol.number_input(
-                            "Tank volume (L)",
-                            min_value=50.0,
-                            max_value=500.0,
-                            step=25.0,
-                            value=float(cfg.get("volume_l", 200.0)),
-                            key=f"{settings_id}_dhw_vol",
-                        )
-                      
-
-                        cfg["usage_level"] = c_use.selectbox(
-                            "Usage level",
-                            {
-                                "Low – 1–2 persons, short showers": "Low",
-                                "Medium – 3–4 persons, normal daily use": "Medium",
-                                "High – 5+ persons or long/frequent showers": "High",
-                            }.keys(),
-                            index=list({
-                                "Low – 1–2 persons, short showers": "Low",
-                                "Medium – 3–4 persons, normal daily use": "Medium",
-                                "High – 5+ persons or long/frequent showers": "High",
-                            }.values()).index(cfg.get("usage_level", "Medium")),
-                            key=f"{settings_id}_dhw_use",
-                            help="Select typical hot-water usage for your household. This changes the daily DHW energy consumption.",
-                        )
-
-                        # Internally store only 'Low' / 'Medium' / 'High'
-                        selected_label = cfg["usage_level"]
-                        label_to_value = {
-                            "Low – 1–2 persons, short showers": "Low",
-                            "Medium – 3–4 persons, normal daily use": "Medium",
-                            "High – 5+ persons or long/frequent showers": "High",
-                        }
-                        cfg["usage_level"] = label_to_value[selected_label]
-
-
-                        # --- Temperature band for tank ---
-                        c_tmin, c_tmax = st.columns(2)
-                        cfg["t_min_c"] = c_tmin.number_input(
-                            "Min tank temperature (°C)",
-                            min_value=30.0,
-                            max_value=70.0,
-                            step=1.0,
-                            value=float(cfg.get("t_min_c", 45.0)),
-                            key=f"{settings_id}_dhw_tmin",
-                        )
-                        cfg["t_max_c"] = c_tmax.number_input(
-                            "Max tank temperature (°C)",
-                            min_value=30.0,
-                            max_value=70.0,
-                            step=1.0,
-                            value=float(cfg.get("t_max_c", 55.0)),
-                            key=f"{settings_id}_dhw_tmax",
-                        )
-                        if cfg["t_max_c"] < cfg["t_min_c"]:
-                            cfg["t_max_c"] = cfg["t_min_c"]
-
-                        # --- Heater power ---
-                        cfg["p_el_kw"] = st.number_input(
-                            "Heater power (kW)",
-                            min_value=0.5,
-                            max_value=10.0,
-                            step=0.5,
-                            value=float(cfg.get("p_el_kw", 2.0)),
-                            key=f"{settings_id}_dhw_pel",
-                        )
-
-                        # thermostat parameters
-                        t_min = float(cfg["t_min_c"])
-                        t_max = float(cfg["t_max_c"])
-                        t_set = 0.5 * (t_min + t_max)
-                        hyst  = max(t_max - t_min, 1.0)
-
-                        # --- Get outdoor temperature from page 1, or fallback ---
-                        if (
-                            "temp_daily" in st.session_state
-                            and isinstance(st.session_state["temp_daily"], pd.Series)
-                            and not st.session_state["temp_daily"].empty
-                        ):
-                            tout_tot = st.session_state["temp_daily"]
-                            tout_minute = get_selected_day_data(tout_tot)
-                            idx_dhw = tout_minute.index
-                            st.caption("Using fetched outdoor temperature for this preview.")
-                        else:
-                            idx_dhw = pd.date_range(
-                                "2025-01-10 00:00", periods=24 * 60, freq="min"
-                            )
-                            hours = idx_dhw.hour + idx_dhw.minute / 60.0
-                            tout_minute = pd.Series(
-                                5.0 + 5.0 * np.sin(2 * np.pi * (hours - 15) / 24.0),
-                                index=idx_dhw,
-                                name="Tout_C",
-                            )
-                            st.caption(
-                                "No weather data found, using a synthetic outdoor temperature profile."
-                            )
-
-                        # --- Build DHW tank model ---
-                        dhw = DHWTank(
-                            volume_l=float(cfg["volume_l"]),
-                            t_set_c=t_set,
-                            hyst_band_c=hyst,
-                            ua_kw_per_c=0.02,  # you can expose later if you want
-                            p_el_kw=float(cfg["p_el_kw"]),
-                            p_off_kw=0.01,
-                            T_cold_c=10.0,
-                            T_amb_c=20.0,
-                            Ti0_c=t_set,
-                            usage_level=cfg["usage_level"],
-                        )
-                        p_dhw = dhw.series_kw(idx_dhw, tout_minute)
-                        cfg["profile_index"] = p_dhw.index.astype(str).tolist()
-                        cfg["profile_kw"]    = p_dhw.values.tolist()
-
-                        # --- Plot DHW electric power ---
-                        st.markdown("<div style='height:0.75rem'></div>",
-                                    unsafe_allow_html=True)
-                        st.markdown("**DHW heater electrical power (preview)**")
-
-                        fig_dhw = go.Figure()
-                        fig_dhw.add_scatter(
-                            x=p_dhw.index,
-                            y=p_dhw.values,
-                            mode="lines",
-                            name="P_DHW_kW",
-                        )
-                        fig_dhw.update_layout(
-                            height=180,
-                            margin=dict(l=10, r=10, t=10, b=8),
-                            xaxis_title="Time",
-                            yaxis_title="kW",
-                            showlegend=False,
-                        )
-                        st.plotly_chart(fig_dhw, use_container_width=True)
-
-                        if st.button("▲ Hide details", key=f"{settings_id}_hide_dhw"):
-                            st.session_state[f"settings_open_{settings_id}"] = False
-                            st.rerun()
-                    # 3) (Generation & Storage) =========================================================
-                    # PV 
-                    # =========================================================
-                    elif cat_key == "gen_store" and dev["type"] == "pv":
-                        st.markdown(
-                            """
-                            <hr style="border: 0; border-top: 1px dotted #bbf7d0; margin: 0.4rem 0;" />
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-                        st.markdown("**PV system settings**")
-
-                        # --- Basic sizing ---
-                        c_wp, c_np = st.columns(2)
-                        cfg["module_wp"] = c_wp.number_input(
-                            "Module nameplate (Wp)",
-                            min_value=50.0,
-                            max_value=1000.0,
-                            step=10.0,
-                            value=float(cfg.get("module_wp", 400.0)),
-                            key=f"{settings_id}_pv_mod_wp",
-                        )
-                        cfg["n_panels"] = c_np.number_input(
-                            "Number of panels",
-                            min_value=0,
-                            max_value=200,
-                            step=1,
-                            value=int(cfg.get("n_panels", 16)),
-                            key=f"{settings_id}_pv_n_panels",
-                        )
-                        kwp = (cfg["module_wp"] * cfg["n_panels"]) / 1000.0
-                        st.caption(f"Total DC size: **{kwp:.2f} kWp**")
-
-                        # --- Orientation & losses ---
-                        c_tilt, c_az = st.columns(2)
-                        cfg["tilt"] = c_tilt.number_input(
-                            "Tilt (°)",
-                            min_value=0.0,
-                            max_value=90.0,
-                            step=1.0,
-                            value=float(cfg.get("tilt", 30.0)),
-                            key=f"{settings_id}_pv_tilt",
-                        )
-                        cfg["azimuth"] = c_az.number_input(
-                            "Azimuth (°; 180 = South)",
-                            min_value=0.0,
-                            max_value=360.0,
-                            step=1.0,
-                            value=float(cfg.get("azimuth", 180.0)),
-                            key=f"{settings_id}_pv_az",
-                        )
-
-                        cfg["loss_frac"] = st.number_input(
-                            "System losses (fraction)",
-                            min_value=0.0,
-                            max_value=0.5,
-                            step=0.01,
-                            value=float(cfg.get("loss_frac", 0.14)),
-                            key=f"{settings_id}_pv_loss",
-                        )
-
-                        # --- Build minute index for selected day ---
-                        # We only need the selected day from Page 1
-                        from datetime import timedelta as _td
-
-                        sel_day = st.session_state.get("day")
-                        if sel_day is not None:
-                            day_start = pd.Timestamp(sel_day)
-                            day_end = day_start + _td(days=1)
-                            idx_pv = pd.date_range(
-                                day_start,
-                                day_end,
-                                freq="min",
-                                inclusive="left",
-                            )
-                        else:
-                            # fallback: synthetic day
-                            idx_pv = pd.date_range(
-                                "2025-01-10 00:00",
-                                periods=24 * 60,
-                                freq="min",
-                            )
-
-                        # --- Use real weather if available, otherwise synthetic ---
-                        pv_series = None                        
-                        if (
-                            "weather_hr" in st.session_state
-                            and isinstance(st.session_state["weather_hr"], pd.DataFrame)
-                            and not st.session_state["weather_hr"].empty
-                            and kwp > 0
-                        ):
-                            weather_hr = st.session_state["weather_hr"]
-                            try:
-                                pv_series = pv_from_weather_modelchain_from_df(
-                                    idx_min=idx_pv,
-                                    dfh=weather_hr,
-                                    lat=float(st.session_state.get("geo_lat", 57.0488)),
-                                    lon=float(st.session_state.get("geo_lon", 9.9217)),
-                                    kwp=kwp,
-                                    tilt_deg=float(cfg["tilt"]),
-                                    az_deg=float(cfg["azimuth"]),
-                                    sys_loss_frac=float(cfg["loss_frac"]),
+                            # Ensure exactly one interval in cfg
+                            intervals = cfg.setdefault("intervals", [])
+                            if not intervals:
+                                intervals.append(
+                                    {"start": _time(20, 0), "end": _time(21, 30)}
                                 )
-                                st.caption("Using fetched weather for PV preview.")
-                            except Exception as e:
-                                st.warning(f"PV preview using weather failed: {e}. Falling back to synthetic curve.")
-                                pv_series = None
+                            elif len(intervals) > 1:
+                                intervals[:] = intervals[:1]
 
-                        if pv_series is None:
-                            # Simple synthetic bell-shaped PV profile for preview only
-                            hours = idx_pv.hour + idx_pv.minute / 60.0
-                            shape = np.maximum(0.0, np.sin(np.pi * (hours - 6.0) / 12.0))
-                            pv_series = pd.Series(kwp * shape, index=idx_pv, name="pv_kw")
-                            st.caption("No usable weather data – showing a synthetic PV curve for preview.")
+                            current_iv = intervals[0]
 
-                        cfg["profile_index"] = pv_series.index.astype(str).tolist()
-                        cfg["profile_kw"]    = pv_series.values.tolist()
+                            st.caption("Current scheduled interval (one continuous block):")
+                            c_a, c_b = st.columns(2)
+                            with c_a:
+                                new_start = st.time_input(
+                                    "Start",
+                                    value=current_iv.get("start", _time(20, 0)),
+                                    key=f"{settings_id}_flex_start",
+                                )
+                            with c_b:
+                                new_end = st.time_input(
+                                    "End",
+                                    value=current_iv.get("end", _time(21, 30)),
+                                    key=f"{settings_id}_flex_end",
+                                )
+                            current_iv["start"], current_iv["end"] = new_start, new_end
 
-                        # --- Plot PV preview ---
-                        st.markdown("<div style='height:0.75rem'></div>", unsafe_allow_html=True)
-                        st.markdown("**PV power for selected day (preview)**")
+                        
+                            st.markdown("**Daily load profile (preview)**")
+                            prof = build_minute_profile(
+                                power_w=cfg["power_w"] * cfg["num_devices"],
+                                intervals=intervals,
+                                step_min=1,
+                            )
+                            cfg["profile_index"] = prof.index.astype(str).tolist()
+                            cfg["profile_kw"]    = prof.values.tolist()
 
-                        fig_pv = go.Figure()
-                        fig_pv.add_scatter(
-                            x=pv_series.index,
-                            y=pv_series.values,
-                            mode="lines",
-                            name="pv_kw",
-                        )
-                        fig_pv.update_layout(
-                            height=180,
-                            margin=dict(l=10, r=10, t=10, b=8),
-                            xaxis_title="Time",
-                            yaxis_title="kW",
-                            showlegend=False,
-                        )
-                        st.plotly_chart(fig_pv, use_container_width=True)
+                            fig_p = go.Figure()
+                            fig_p.add_scatter(
+                                x=prof.index,
+                                y=prof.values,
+                                mode="lines",
+                                name="P_flex_total_kW",
+                            )
+                            fig_p.update_layout(
+                                height=180,
+                                margin=dict(l=10, r=10, t=10, b=8),
+                                xaxis_title="Time",
+                                yaxis_title="kW",
+                                showlegend=False,
+                            )
+                            st.plotly_chart(fig_p, use_container_width=True)
 
-                        # Hide button
-                        if st.button("▲ Hide details", key=f"{settings_id}_hide_pv"):
-                            st.session_state[f"settings_open_{settings_id}"] = False
-                            st.rerun()
+                            # per-device reset to defaults
+                            if st.button("↩ Reset this device to defaults",
+                                         key=f"{settings_id}_reset_flex"):
+                                new_cfg = get_default_config(dev_type, "elec_flex")
+                                cfgs[full_key] = new_cfg
+                                st.success("Device reset to default flexible settings.")
+                                st.rerun()
 
-                    # =========================================================
-                    # BATTERY (Generation & Storage)
-                    # =========================================================
-                    elif cat_key == "gen_store" and dev["type"] == "battery":
+                            if st.button("▲ Hide details", key=f"{settings_id}_hide_flex"):
+                                st.session_state[open_key] = False
+                                st.rerun()
 
-                        st.markdown(
-                            "<hr style='border:0;border-top:1px dotted #bbf7d0;margin:0.4rem 0;'/>",
-                            unsafe_allow_html=True
-                        )
-                        st.markdown("**Battery settings can be input in next page**")
-                        # Hide button
-                        if st.button("▲ Hide details", key=f"{settings_id}_batt_hide"):
-                            st.session_state[f"settings_open_{settings_id}"]=False
-                            st.rerun()
-                    
-                    # =========================================================
-                    # FC (Generation & Storage)
-                    # =========================================================
-                    elif cat_key == "gen_store" and dev["type"] == "fuel_cell":
-                        st.markdown(
-                            "<hr style='border:0;border-top:1px dotted #bbf7d0;margin:0.4rem 0;'/>",
-                            unsafe_allow_html=True,
-                        )
-                        st.markdown("**Fuel cell (methanol-reformed HT-PEM)**")
+                    # =======================================================
+                    # C) THERMAL DEVICES – behave like normal devices
+                    # =======================================================
+                    elif cat_key == "thermal":
+                        # three dev_types: space_heat, dhw, leisure
+                        # panel opens only when st.session_state[open_key] is True
+                        cfg = cfgs.get(full_key)
+                        if cfg is None:
+                            cfg = {}
+                            cfgs[full_key] = cfg
 
-                        # --- Basic sizing ---
-                        c1, c2 = st.columns(2)
-                        cfg["p_rated_kw"] = c1.number_input(
-                            "Rated electrical power (kW)",
-                            min_value=0.5,
-                            max_value=50.0,
-                            step=0.5,
-                            value=float(cfg.get("p_rated_kw", 4.8)),   # ~4.8 kW example
-                            key=f"{settings_id}_fc_prated",
-                        )
-                        cfg["p_min_frac"] = c2.slider(
-                            "Minimum loading (% of rated)",
-                            min_value=0,
-                            max_value=100,
-                            value=int(cfg.get("p_min_frac", 40)),
-                            step=5,
-                            key=f"{settings_id}_fc_pminfrac",
-                        )
+                        # read shared params prepared at top
+                        hpar = st.session_state.get("thermal_house_params", {})
+                        ua_base   = float(hpar.get("ua_kw_per_c", 0.12))
+                        Cth_base  = float(hpar.get("C_th_kwh_per_c", 0.60))
+                        tmin_def  = float(hpar.get("t_min_default", 20.0))
+                        tmax_def  = float(hpar.get("t_max_default", 22.0))
 
-                        p_rated_kw = float(cfg["p_rated_kw"])
-                        p_min_kw   = p_rated_kw * (cfg["p_min_frac"] / 100.0)
+                        def _get_outdoor_profile_local():
+                            return _get_outdoor_profile()  # from pre-block above
 
-                        # store in W for the cost model
-                        p_rated_W = p_rated_kw * 1000.0
-                        p_min_W   = p_min_kw   * 1000.0
+                        # ----- 1) SPACE HEATING ---------------------------------
+                        if dev_type == "space_heat":
+                            st.markdown(
+                                "<hr style='border-top: 1px dotted #fecaca; margin:0.4rem 0;'/>",
+                                unsafe_allow_html=True,
+                            )
+                            st.markdown("**Space heating system**")
 
-                        # --- Fuel cost parameter (equivalent methanol cost) ---
-                        st.markdown("**Fuel economics**")
-                        cfg["methanol_price"] = st.number_input(
-                            "Methanol cost (DKK per kWh of fuel)",
-                            min_value=0.0,
-                            max_value=50.0,
-                            step=0.1,
-                            value=float(cfg.get("methanol_price", 3.75)),  # choose whatever default you used before
-                            key=f"{settings_id}_fc_methprice",
-                        )
-                        meth_price = float(cfg["methanol_price"])
+                            # subtype
+                            space_options = [
+                                "None (external supply)",
+                                "Electric panels",
+                                "Heat pump – air-to-air",
+                                "Heat pump – air-to-water",
+                            ]
+                            mode_default = cfg.get("space_mode", "Electric panels")
+                            if mode_default not in space_options:
+                                mode_default = "Electric panels"
 
-                        st.caption(
-                            "This value should be consistent with the methanol cost you purchased "
-                        )
+                            space_mode = st.radio(
+                                "Which space heating system do you use?",
+                                options=space_options,
+                                index=space_options.index(mode_default),
+                                key=f"{settings_id}_space_mode",
+                            )
+                            cfg["space_mode"] = space_mode
 
-                        # --- Economic schedule for selected day (15-min) ---
-                        st.markdown("**Economic schedule for selected daymarkdown**")
+                            # comfort range
+                            c_tmin, c_tmax = st.columns(2)
+                            cfg["t_min_c"] = c_tmin.number_input(
+                                "Min indoor temperature (°C)",
+                                min_value=5.0,
+                                max_value=30.0,
+                                step=0.5,
+                                value=float(cfg.get("t_min_c", tmin_def)),
+                                key=f"{settings_id}_tmin",
+                            )
+                            cfg["t_max_c"] = c_tmax.number_input(
+                                "Max indoor temperature (°C)",
+                                min_value=5.0,
+                                max_value=30.0,
+                                step=0.5,
+                                value=float(cfg.get("t_max_c", tmax_def)),
+                                key=f"{settings_id}_tmax",
+                            )
+                            if cfg["t_max_c"] < cfg["t_min_c"]:
+                                cfg["t_max_c"] = cfg["t_min_c"]
 
-                        if st.button("💡 Suggest FC power schedule (minute)", key=f"{settings_id}_fc_suggest"):
-                            if "price_daily" not in st.session_state or st.session_state["price_daily"].empty:
-                                st.warning("No price data or selected day found.")
-                            else:
-                                price_tot = st.session_state["price_daily"]
-                                sel_day = st.session_state["day"]
-                                day_start = pd.Timestamp(sel_day)
-                                day_end   = day_start + pd.Timedelta(days=1)
+                            t_min = float(cfg["t_min_c"])
+                            t_max = float(cfg["t_max_c"])
+                            t_set = 0.5 * (t_min + t_max)
+                            hyst  = max(t_max - t_min, 0.5)
+                            Cth_eff = Cth_base
 
-                                # exact minute-resolution selection
-                                price_min = price_tot.loc[(price_tot.index >= day_start) & (price_tot.index < day_end)]
-                                if price_min.empty:
-                                    st.warning("No price data for the day.")
-                                else:
-                                    prices = price_min.values  # 1440 points
+                            P_space = None
+                            Ti_space = None
 
-                                    opti_W, fvals = solve_fc_schedule_minute(
-                                        prices,
-                                        Price_ch3oh=meth_price,
-                                        Pmin_W=p_min_W,
-                                        Prated_W=p_rated_W,
-                                    )
-                                    idx_min = price_min.index
-                                    p_fc_raw = pd.Series(opti_W, index=idx_min, name="fc_kw")
-                                    p_fc_smooth = smooth_fc_schedule(
-                                        p_fc_raw,
-                                        dt_min=1,
-                                        min_on_min=60,   # e.g. at least 1 h once started
-                                        min_off_min=30,  # don't stop for tiny 15-min gaps
-                                    )
+                            if space_mode == "None (external supply)":
+                                idx_hp, _tout = _get_outdoor_profile_local()
+                                P_space = pd.Series(0.0, index=idx_hp, name="P_space_kW")
+                                st.info("No electric space heating – maybe district heating, gas, or external boiler.")
 
+                            elif space_mode == "Electric panels":
+                                cfg["q_kw"] = st.number_input(
+                                    "Total panel capacity (kW)",
+                                    min_value=1.0,
+                                    max_value=30.0,
+                                    step=0.5,
+                                    value=float(cfg.get("q_kw", 6.0)),
+                                    key=f"{settings_id}_q_elec",
+                                )
+                                q_rated = float(cfg["q_kw"])
 
-                                    cfg["fc_schedule_minute_kw"] = p_fc_smooth / 1000.0
-                                    cfg["fc_schedule_minute_index"] = price_min.index.astype(str).tolist()
+                                idx_hp, tout = _get_outdoor_profile_local()
+                                eh = WeatherELheater(
+                                    ua_kw_per_c=ua_base,
+                                    t_set_c=t_set,
+                                    q_rated_kw=q_rated,
+                                    C_th_kwh_per_c=Cth_eff,
+                                    hyst_band_c=hyst,
+                                    p_off_kw=0.05,
+                                    min_on_min=0,
+                                    min_off_min=0,
+                                    Ti0_c=t_set,
+                                )
+                                P_space,Ti_space  = eh.series_kw(idx_hp, tout)
 
-                                    st.success("FC schedule computed (minute-level).")
+                            elif space_mode == "Heat pump – air-to-air":
+                                st.caption("Heats air directly, cannot heat water.")
 
+                                hp_type_default = cfg.get("hp_type", "Fixed power")
+                                hp_type = st.radio(
+                                    "Heat pump type",
+                                    options=["Fixed power", "Variable power"],
+                                    index=["Fixed power", "Variable power"].index(hp_type_default),
+                                    horizontal=True,
+                                    key=f"{settings_id}_hp_ataa_type",
+                                )
+                                cfg["hp_type"] = hp_type
+                                hp_mode = "onoff" if hp_type == "Fixed power" else "modulating"
 
-                        # --- Plot schedule if available ---
-                        if "fc_schedule_minute_kw" in cfg and cfg.get("fc_schedule_minute_kw") is not None:
-                            try:
-                                idx = pd.to_datetime(cfg.get("fc_schedule_minute_index", []))
-                                p_kw = np.asarray(cfg["fc_schedule_minute_kw"], dtype=float)
-                                if len(idx) == len(p_kw) and len(idx) > 0:
-                                    s = pd.Series(p_kw, index=idx, name="P_FC_kW")
+                                cfg["q_kw"] = st.number_input(
+                                    "Heat pump capacity (kW, thermal)",
+                                    min_value=1.0,
+                                    max_value=20.0,
+                                    step=0.5,
+                                    value=float(cfg.get("q_kw", 6.0)),
+                                    key=f"{settings_id}_q_ataa",
+                                )
+                                q_rated = float(cfg["q_kw"])
 
-                                    fig_fc = go.Figure()
-                                    fig_fc.add_scatter(
-                                        x=s.index,
-                                        y=s.values,
-                                        mode="lines",
-                                        name="P_FC_kW",
-                                    )
-                                    st.markdown("**Suggested FC electrical power (15-min)**")
-                                    fig_fc.update_layout(
-                                        height=200,
-                                        margin=dict(l=10, r=10, t=10, b=8),
+                                idx_hp, tout = _get_outdoor_profile_local()
+                                hp = WeatherHP(
+                                    mode=hp_mode,
+                                    ua_kw_per_c=ua_base,
+                                    t_set_c=t_set,
+                                    q_rated_kw=q_rated,
+                                    cop_at_7c=3.2,
+                                    cop_min=1.6,
+                                    cop_max=4.2,
+                                    C_th_kwh_per_c=Cth_eff,
+                                    hyst_band_c=hyst,
+                                    p_off_kw=0.05,
+                                    defrost=True,
+                                    min_on_min=0,
+                                    min_off_min=0,
+                                    Ti0_c=t_set,
+                                )
+                                P_space,Ti_space  = hp.series_kw(idx_hp, tout)
+
+                            elif space_mode == "Heat pump – air-to-water":
+                                st.caption("Heats water to radiators / floor heating. Can also feed a DHW tank.")
+
+                                hp_type_default = cfg.get("hp_type", "Fixed power")
+                                hp_type = st.radio(
+                                    "Heat pump type",
+                                    options=["Fixed power", "Variable power"],
+                                    index=["Fixed power", "Variable power"].index(hp_type_default),
+                                    horizontal=True,
+                                    key=f"{settings_id}_hp_ataw_type",
+                                )
+                                cfg["hp_type"] = hp_type
+                                hp_mode = "onoff" if hp_type == "Fixed power" else "modulating"
+
+                                cfg["q_kw"] = st.number_input(
+                                    "Heat pump capacity (kW, thermal)",
+                                    min_value=3.0,
+                                    max_value=25.0,
+                                    step=0.5,
+                                    value=float(cfg.get("q_kw", 8.0)),
+                                    key=f"{settings_id}_q_ataw",
+                                )
+                                q_rated = float(cfg["q_kw"])
+
+                                dist_options = ["Radiators", "Floor heating", "Both"]
+                                dist_default = cfg.get("distribution", "Radiators")
+                                if dist_default not in dist_options:
+                                    dist_default = "Radiators"
+                                dist_mode = st.selectbox(
+                                    "Heat distribution system",
+                                    options=dist_options,
+                                    index=dist_options.index(dist_default),
+                                    key=f"{settings_id}_distribution",
+                                )
+                                cfg["distribution"] = dist_mode
+
+                                extra_mass = {"Radiators": 0.0, "Floor heating": 0.5, "Both": 0.3}[dist_mode]
+                                Cth_eff = Cth_base * (1.0 + extra_mass)
+
+                                idx_hp, tout = _get_outdoor_profile_local()
+                                hp = WeatherHP(
+                                    mode=hp_mode,
+                                    ua_kw_per_c=ua_base,
+                                    t_set_c=t_set,
+                                    q_rated_kw=q_rated,
+                                    cop_at_7c=3.2,
+                                    cop_min=1.6,
+                                    cop_max=4.2,
+                                    C_th_kwh_per_c=Cth_eff,
+                                    hyst_band_c=hyst,
+                                    p_off_kw=0.05,
+                                    defrost=True,
+                                    min_on_min=0,
+                                    min_off_min=0,
+                                    Ti0_c=t_set,
+                                )
+                                P_space,Ti_space = hp.series_kw(idx_hp, tout)
+
+                            if P_space is not None:
+                                st.markdown("**Space-heating electric power (preview)**")
+                                fig = go.Figure()
+                                fig.add_scatter(x=P_space.index, y=P_space.values, mode="lines")
+                                fig.update_layout(
+                                    height=180,
+                                    margin=dict(l=10, r=10, t=8, b=8),
+                                    xaxis_title="Time",
+                                    yaxis_title="kW",
+                                    showlegend=False,
+                                )
+                                st.plotly_chart(fig, use_container_width=True,
+                                                key=f"{settings_id}_space_power")   # ← add key here
+                                cfg["profile_index"] = P_space.index.astype(str).tolist()
+                                cfg["profile_kw"]    = P_space.values.tolist()
+
+                                if 'Ti_space' in locals() and Ti_space is not None:
+                                    st.markdown("**Indoor temperature (preview)**")
+                                    fig_T = go.Figure()
+                                    fig_T.add_scatter(x=Ti_space.index, y=Ti_space.values, mode="lines", name="Ti")
+                                    # optional: show comfort band lines
+                                    fig_T.add_hline(y=t_min, line_dash="dot")
+                                    fig_T.add_hline(y=t_max, line_dash="dot")
+                                    fig_T.update_layout(
+                                        height=180,
+                                        margin=dict(l=10, r=10, t=8, b=8),
                                         xaxis_title="Time",
-                                        yaxis_title="kW",
+                                        yaxis_title="°C",
                                         showlegend=False,
                                     )
-                                    st.plotly_chart(fig_fc, use_container_width=True)
-                                else:
-                                    st.caption("No valid FC schedule stored yet.")
-                            except Exception:
-                                st.caption("No valid FC schedule stored yet.")
+                                    st.plotly_chart(fig_T, use_container_width=True,key=f"{settings_id}_space_temp")
 
-                        # Hide button
-                        if st.button("▲ Hide details", key=f"{settings_id}_hide_fc"):
-                            st.session_state[f"settings_open_{settings_id}"] = False
-                            st.rerun()
+                            if st.button("▲ Hide", key=f"{settings_id}_hide_space"):
+                                st.session_state[open_key] = False
+                                st.rerun()
 
-                    elif cat_key == "ev" and dev["type"] == "ev":
-                        st.markdown(
-                            """
-                            <hr style="border: 0; border-top: 1px dotted #bfdbfe; margin: 0.4rem 0;" />
-                            """,
-                            unsafe_allow_html=True,
-                        )
-                        st.markdown("**EV charging settings (01:00–06:00 window)**")
-
-                        # --- Charger & battery ---
-                        c_p, c_cap = st.columns(2)
-                        cfg["power_kw"] = c_p.number_input(
-                            "Charger power (kW)",
-                            min_value=1.0,
-                            max_value=50.0,
-                            step=0.5,
-                            value=float(cfg.get("power_kw", 11.0)),
-                            key=f"{settings_id}_ev_power",
-                        )
-                        cfg["capacity_kwh"] = c_cap.number_input(
-                            "EV battery capacity (kWh)",
-                            min_value=10.0,
-                            max_value=200.0,
-                            step=1.0,
-                            value=float(cfg.get("capacity_kwh", 75.0)),
-                            key=f"{settings_id}_ev_cap",
-                        )
-
-                        c_soc_a, c_soc_t = st.columns(2)
-                        cfg["soc_arrive"] = c_soc_a.number_input(
-                            "Arrival SOC (%)",
-                            min_value=0.0,
-                            max_value=100.0,
-                            step=5.0,
-                            value=float(cfg.get("soc_arrive", 20.0)),
-                            key=f"{settings_id}_ev_soc_a",
-                        )
-                        cfg["soc_target"] = c_soc_t.number_input(
-                            "Target SOC at departure (%)",
-                            min_value=0.0,
-                            max_value=100.0,
-                            step=5.0,
-                            value=float(cfg.get("soc_target", 80.0)),
-                            key=f"{settings_id}_ev_soc_t",
-                        )
-                        if cfg["soc_target"] < cfg["soc_arrive"]:
-                            cfg["soc_target"] = cfg["soc_arrive"]
-
-                        # Needed energy and duration (minutes)
-                        delta_soc = max(cfg["soc_target"] - cfg["soc_arrive"], 0.0) / 100.0
-                        energy_need = delta_soc * cfg["capacity_kwh"]      # kWh
-                        if cfg["power_kw"] > 0 and energy_need > 0:
-                            duration_min = int(np.ceil(energy_need * 60.0 / cfg["power_kw"]))
-                        else:
-                            duration_min = 0
-                        cfg["duration_min"] = duration_min
-
-                        st.caption(
-                            f"Energy needed ≈ **{energy_need:.1f} kWh**, "
-                            f"charging time ≈ **{duration_min} min** at {cfg['power_kw']:.1f} kW."
-                        )
-
-                        # Cost/CO2 preference
-                        cfg["w_cost"] = float(
-                            st.slider(
-                                "Preference (0 = CO₂ only, 1 = cost only)",
-                                min_value=0.0,
-                                max_value=1.0,
-                                step=0.05,
-                                value=float(cfg.get("w_cost", 0.5)),
-                                key=f"{settings_id}_ev_w_cost",
+                        # ----- 2) DHW SYSTEM -------------------------------------
+                        elif dev_type == "dhw":
+                            st.markdown(
+                                "<hr style='border-top: 1px dotted #bfdbfe; margin:0.4rem 0;'/>",
+                                unsafe_allow_html=True,
                             )
-                        )
+                            st.markdown("**Domestic hot water (DHW)**")
 
-                        # Single interval in cfg
-                        from datetime import datetime, timedelta, time as _time
+                            dhw_options = [
+                                "None (external supply)",
+                                "Electric DHW tank",
+                                "Heat pump DHW tank",
+                            ]
+                            mode_default = cfg.get("dhw_mode", "None (external supply)")
+                            if mode_default not in dhw_options:
+                                mode_default = "None (external supply)"
 
-                        intervals = cfg.setdefault("intervals", [])
-                        if not intervals:
-                            intervals.append(
-                                {"start": _time(1, 0), "end": _time(6, 0)}
+                            dhw_mode = st.radio(
+                                "How is your domestic hot water heated?",
+                                options=dhw_options,
+                                index=dhw_options.index(mode_default),
+                                key=f"{settings_id}_dhw_mode",
                             )
-                        elif len(intervals) > 1:
-                            intervals[:] = intervals[:1]
+                            cfg["dhw_mode"] = dhw_mode
 
-                        current_iv = intervals[0]
+                            P_dhw = None
+                            T_tank = None
+                            idx_dhw, tout = _get_outdoor_profile_local()
 
-                        st.caption("Current scheduled interval (single continuous block):")
-                        c_a, c_b = st.columns(2)
-                        with c_a:
-                            start_time = c_a.time_input(
-                                "Start (01:00–06:00 preferred)",
-                                value=current_iv.get("start", _time(1, 0)),
-                                key=f"{settings_id}_ev_start",
-                            )
-
-                        # recompute end from duration
-                        if duration_min > 0:
-                            dt0 = datetime.combine(date.today(), start_time)
-                            dt1 = dt0 + timedelta(minutes=duration_min)
-                            end_time = dt1.time()
-                        else:
-                            end_time = current_iv.get("end", _time(1, 30))
-
-                        with c_b:
-                            st.time_input(
-                                "End (computed)",
-                                value=end_time,
-                                key=f"{settings_id}_ev_end_display",
-                                disabled=True,
-                            )
-
-                        current_iv["start"], current_iv["end"] = start_time, end_time
-
-                        # Suggest button (search only 01:00–06:00 using price/CO₂)
-                        if st.button("💡 Suggest cheapest/cleanest in 01:00–06:00",
-                                     key=f"{settings_id}_ev_suggest"):
-                            if duration_min <= 0:
-                                st.warning("No energy needed (arrival SOC ≥ target SOC).")
+                            if dhw_mode == "None (external supply)":
+                                st.info("DHW provided by district heating / gas / shared system – EMS does not heat it.")
+                                P_dhw = pd.Series(0.0, index=idx_dhw, name="P_DHW_kW")
                             else:
-                                interval = suggest_best_interval_for_ev(
-                                    duration_min=duration_min,
-                                    w_cost=cfg["w_cost"],
-                                    window_start_min=60,
-                                    window_end_min=360,
+                                # defaults from house info
+                                hi = st.session_state.get(
+                                    "house_info",
+                                    {"size": "Medium house", "insulation": "Average", "residents": 2},
                                 )
-                                if interval is None:
-                                    st.warning(
-                                        "No price/CO₂ data or no selected day. "
-                                        "Please select a day and fetch data on page 1 first."
-                                    )
+                                n_res = int(hi.get("residents", 2))
+                                size_str = (hi.get("size") or "Medium house").lower()
+                                if "small" in size_str:
+                                    vol_default = 160.0
+                                elif "large" in size_str:
+                                    vol_default = 300.0
                                 else:
-                                    intervals[0] = interval
-                                    st.success(
-                                        f"Suggested interval: "
-                                        f"{interval['start'].strftime('%H:%M')}–"
-                                        f"{interval['end'].strftime('%H:%M')}"
+                                    vol_default = 200.0
+                                if n_res <= 2:
+                                    usage_default = "Low"
+                                elif n_res <= 4:
+                                    usage_default = "Medium"
+                                else:
+                                    usage_default = "High"
+
+                                c_vol, c_use = st.columns(2)
+                                cfg["volume_l"] = c_vol.number_input(
+                                    "Tank volume (L)",
+                                    min_value=50.0,
+                                    max_value=500.0,
+                                    step=25.0,
+                                    value=float(cfg.get("volume_l", vol_default)),
+                                    key=f"{settings_id}_dhw_vol",
+                                )
+
+                                label_map = {
+                                    "Low – 1–2 persons, short showers": "Low",
+                                    "Medium – 3–4 persons, normal use": "Medium",
+                                    "High – 5+ persons or long showers": "High",
+                                }
+                                reverse_map = {v: k for k, v in label_map.items()}
+                                usage_now = cfg.get("usage_level", usage_default)
+                                usage_label_default = reverse_map[usage_now]
+
+                                usage_label = c_use.selectbox(
+                                    "Usage level",
+                                    label_map.keys(),
+                                    index=list(label_map.keys()).index(usage_label_default),
+                                    key=f"{settings_id}_dhw_usage",
+                                )
+                                cfg["usage_level"] = label_map[usage_label]
+
+                                c_tmin, c_tmax = st.columns(2)
+                                cfg["t_min_c"] = c_tmin.number_input(
+                                    "Min tank temperature (°C)",
+                                    min_value=30.0,
+                                    max_value=70.0,
+                                    step=1.0,
+                                    value=float(cfg.get("t_min_c", 45.0)),
+                                    key=f"{settings_id}_dhw_tmin",
+                                )
+                                cfg["t_max_c"] = c_tmax.number_input(
+                                    "Max tank temperature (°C)",
+                                    min_value=30.0,
+                                    max_value=70.0,
+                                    step=1.0,
+                                    value=float(cfg.get("t_max_c", 55.0)),
+                                    key=f"{settings_id}_dhw_tmax",
+                                )
+                                if cfg["t_max_c"] < cfg["t_min_c"]:
+                                    cfg["t_max_c"] = cfg["t_min_c"]
+
+                                t_min_tank = float(cfg["t_min_c"])
+                                t_max_tank = float(cfg["t_max_c"])
+                                t_set_tank = 0.5 * (t_min_tank + t_max_tank)
+                                hyst_tank  = max(t_max_tank - t_min_tank, 1.0)
+
+                                default_p = 2.0 if dhw_mode == "Electric DHW tank" else 1.5
+                                cfg["p_el_kw"] = st.number_input(
+                                    "Heater power (kW, thermal side)",
+                                    min_value=0.5,
+                                    max_value=10.0,
+                                    step=0.5,
+                                    value=float(cfg.get("p_el_kw", default_p)),
+                                    key=f"{settings_id}_dhw_pel",
+                                )
+
+                                if dhw_mode == "Electric DHW tank":
+                                    tank = DHWTank(
+                                        volume_l=float(cfg["volume_l"]),
+                                        t_set_c=t_set_tank,
+                                        hyst_band_c=hyst_tank,
+                                        ua_kw_per_c=0.02,
+                                        p_el_kw=float(cfg["p_el_kw"]),
+                                        p_off_kw=0.01,
+                                        T_cold_c=10.0,
+                                        T_amb_c=20.0,
+                                        Ti0_c=t_set_tank,
+                                        usage_level=cfg["usage_level"],
                                     )
+                                    P_dhw,T_tank  = tank.series_kw(idx_dhw, tout)
+                                else:
+                                    # HP DHW tank – approximate electrical power via COP
+                                    tank = DHWTank(
+                                        volume_l=float(cfg["volume_l"]),
+                                        t_set_c=t_set_tank,
+                                        hyst_band_c=hyst_tank,
+                                        ua_kw_per_c=0.02,
+                                        p_el_kw=float(cfg["p_el_kw"]) * 2.5,  # thermal
+                                        p_off_kw=0.01,
+                                        T_cold_c=10.0,
+                                        T_amb_c=20.0,
+                                        Ti0_c=t_set_tank,
+                                        usage_level=cfg["usage_level"],
+                                    )
+                                    Q_th,T_tank = tank.series_kw(idx_dhw, tout)
+                                    cop = 2.5
+                                    P_dhw = Q_th / cop
+                                    P_dhw.name = "P_DHW_HP_kW"
+
+                            if P_dhw is not None:
+                                st.markdown("**DHW electrical power (preview)**")
+                                fig = go.Figure()
+                                fig.add_scatter(x=P_dhw.index, y=P_dhw.values, mode="lines")
+                                fig.update_layout(
+                                    height=180,
+                                    margin=dict(l=10, r=10, t=8, b=8),
+                                    xaxis_title="Time",
+                                    yaxis_title="kW",
+                                    showlegend=False,
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+                                
+                                if 'T_tank' in locals() and T_tank is not None:
+                                    st.markdown("**DHW tank temperature (preview)**")
+                                    fig_T = go.Figure()
+                                    fig_T.add_scatter(x=T_tank.index, y=T_tank.values, mode="lines")
+                                    fig_T.add_hline(y=t_min_tank, line_dash="dot")
+                                    fig_T.add_hline(y=t_max_tank, line_dash="dot")
+                                    fig_T.update_layout(
+                                        height=180,
+                                        margin=dict(l=10, r=10, t=8, b=8),
+                                        xaxis_title="Time",
+                                        yaxis_title="°C",
+                                        showlegend=False,
+                                    )
+                                    st.plotly_chart(fig_T, use_container_width=True)
+                                cfg["profile_index"] = P_dhw.index.astype(str).tolist()
+                                cfg["profile_kw"]    = P_dhw.values.tolist()
+
+                            if st.button("▲ Hide", key=f"{settings_id}_hide_dhw"):
+                                st.session_state[open_key] = False
+                                st.rerun()
+
+                        # ----- 3) LEISURE THERMAL LOADS (hot tub + pool + sauna) -----
+                        elif dev_type == "leisure":
+                            st.markdown(
+                                "<hr style='border-top: 1px dotted #bbf7d0; margin:0.4rem 0;'/>",
+                                unsafe_allow_html=True,
+                            )
+                            st.markdown("**Leisure thermal loads**")
+
+                            # always get a daily index + outdoor T once
+                            idx_day, tout_day = _get_outdoor_profile_local()
+
+                            # ensure cfg is a dict
+                            if not isinstance(cfg, dict):
+                                cfg = {}
+                                cfgs[full_key] = cfg
+
+                            # ---- three toggles in one row ----
+                            col_ht, col_pool = st.columns(2)
+                            with col_ht:
+                                cfg["hot_tub_enabled"] = st.checkbox(
+                                    "🛁 Hot tub / spa",
+                                    value=bool(cfg.get("hot_tub_enabled", False)),
+                                    key=f"{settings_id}_ht_enable",
+                                )
+                            with col_pool:
+                                cfg["pool_enabled"] = st.checkbox(
+                                    "🏊 Pool heater",
+                                    value=bool(cfg.get("pool_enabled", False)),
+                                    key=f"{settings_id}_pool_enable",
+                                )
+                  
+
+                            # storage for sub-profiles
+                            P_ht = P_pool  = None
+
+                            # ======================================================
+                            # HOT TUB / SPA
+                            # ======================================================
+                            if cfg.get("hot_tub_enabled", False):
+                                st.markdown("### 🛁 Hot tub")
+                                st.caption("This model uses a built-in electric heater (COP = 1).")
+
+
+                                c_tgt, c_idle = st.columns(2)
+                                cfg["ht_target_c"] = c_tgt.number_input(
+                                    "Target water temperature (°C)",
+                                    min_value=25.0,
+                                    max_value=45.0,
+                                    step=0.5,
+                                    value=float(cfg.get("ht_target_c", 40.0)),
+                                    key=f"{settings_id}_ht_Ttarget",
+                                )
+                                cfg["ht_idle_c"] = c_idle.number_input(
+                                    "Idle temperature (°C)",
+                                    min_value=10.0,
+                                    max_value=40.0,
+                                    step=0.5,
+                                    value=float(cfg.get("ht_idle_c", 30.0)),
+                                    key=f"{settings_id}_ht_Tidle",
+                                )
+                                if cfg["ht_idle_c"] > cfg["ht_target_c"]:
+                                    cfg["ht_idle_c"] = cfg["ht_target_c"]
+
+                                c_vol, c_pow = st.columns(2)
+                                cfg["ht_water_l"] = c_vol.number_input(
+                                    "Water volume (L)",
+                                    min_value=400.0,
+                                    max_value=3000.0,
+                                    step=50.0,
+                                    value=float(cfg.get("ht_water_l", 1200.0)),
+                                    key=f"{settings_id}_ht_vol",
+                                )
+                                cfg["ht_heater_kw"] = c_pow.number_input(
+                                    "Heater capacity (kW)",
+                                    min_value=1.0,
+                                    max_value=12.0,
+                                    step=0.5,
+                                    value=float(cfg.get("ht_heater_kw", 5.0)),
+                                    key=f"{settings_id}_ht_kw",
+                                )
+
+                                ins_levels = ["Good cover", "Average", "Poor"]
+                                ins_default = cfg.get("ht_insulation", "Average")
+                                if ins_default not in ins_levels:
+                                    ins_default = "Average"
+                                cfg["ht_insulation"] = st.selectbox(
+                                    "Cover / insulation level",
+                                    ins_levels,
+                                    index=ins_levels.index(ins_default),
+                                    key=f"{settings_id}_ht_ins",
+                                )
+                                ins = cfg["ht_insulation"]
+                                ua_base_ht = 0.07
+                                if ins == "Good cover":
+                                    ua_ht = ua_base_ht * 0.6
+                                elif ins == "Poor":
+                                    ua_ht = ua_base_ht * 1.4
+                                else:
+                                    ua_ht = ua_base_ht
+
+                                # ---- estimated preheat time ----
+                                C_kwh_per_c_ht = max(cfg["ht_water_l"] * 1.16 / 1000.0, 1e-6)
+                                delta_c_ht = max(cfg["ht_target_c"] - cfg["ht_idle_c"], 0.0)
+                                E_ht = C_kwh_per_c_ht * delta_c_ht   # kWh
+                                if cfg["ht_heater_kw"] > 0:
+                                    t_est_h_ht = E_ht / cfg["ht_heater_kw"]
+                                else:
+                                    t_est_h_ht = 0.0
+                                t_est_min_ht = int(round(t_est_h_ht * 60.0))
+                                st.caption(f"Rough time from idle to target ≈ {t_est_h_ht:.1f} h.")
+
+                 
+                                st.markdown("**Use sessions**")
+                                sessions = cfg.get("ht_sessions") 
+                                if sessions is None:
+                                    sessions = []   # start empty the very first time
+                                del_idx = None
+                                for j, sess in enumerate(sessions):
+                                    c_s, c_d, c_del = st.columns([0.4, 0.4, 0.2])
+                                    with c_s:
+                                        s_t = c_s.time_input(
+                                            "Start",
+                                            value=sess.get("start", _time(20, 0)),
+                                            key=f"{settings_id}_ht_s_{j}",
+                                        )
+                                    with c_d:
+                                        dur = c_d.number_input(
+                                            "Duration (min)",
+                                            min_value=15,
+                                            max_value=600,
+                                            step=15,
+                                            value=int(sess.get("duration_min", 60)),
+                                            key=f"{settings_id}_ht_d_{j}",
+                                        )
+                                    with c_del:
+                                        if c_del.button("🗑", key=f"{settings_id}_ht_del_{j}"):
+                                            del_idx = j
+                                    sess["start"] = s_t
+                                    sess["duration_min"] = dur
+
+                                if del_idx is not None:
+                                    sessions.pop(del_idx)
+                                    cfg["ht_sessions"] = sessions
                                     st.rerun()
 
-                        # Preview profile (kW)
-                        st.markdown("**Daily EV charging profile (preview)**")
-                        prof_ev = build_minute_profile(
-                            power_w=cfg["power_kw"] * 1000.0,  # W input
-                            intervals=intervals,
-                            step_min=1,
-                        )
-                        cfg["profile_index"] = prof_ev.index.astype(str).tolist()
-                        cfg["profile_kw"]    = prof_ev.values.tolist()
+                                if st.button("➕ Add use session", key=f"{settings_id}_ht_add"):
+                                    sessions.append({"start": _time(19, 0), "duration_min": 60})
+                                    cfg["ht_sessions"] = sessions
+                                    st.rerun()
 
-                        fig_ev = go.Figure()
-                        fig_ev.add_scatter(
-                            x=prof_ev.index,
-                            y=prof_ev.values,
-                            mode="lines",
-                            name="P_EV_kW",
-                        )
-                        fig_ev.update_layout(
-                            height=180,
-                            margin=dict(l=10, r=10, t=10, b=8),
-                            xaxis_title="Time",
-                            yaxis_title="kW",
-                            showlegend=False,
-                        )
-                        st.plotly_chart(fig_ev, use_container_width=True)
+                                cfg["ht_sessions"] = sessions
 
-                        if st.button("▲ Hide details", key=f"{settings_id}_hide_ev"):
-                            st.session_state[f"settings_open_{settings_id}"] = False
-                            st.rerun()
+                                # indoor ambient, e.g. 21 °C
+                                ht = WeatherHotTub(
+                                    target_c=float(cfg["ht_target_c"]),
+                                    idle_c=float(cfg["ht_idle_c"]),
+                                    heater_kw=float(cfg["ht_heater_kw"]),
+                                    water_l=float(cfg["ht_water_l"]),
+                                    ua_kw_per_c=float(ua_ht),
+                                    sessions=sessions,
+                                    use_outdoor_for_ambient=False,     # ✅ indoor
+                                    indoor_ambient_c=21.0,
+                                )
+                                P_ht, T_ht = ht.series_kw(idx_day, tout_day)
+
+                                st.markdown("**Hot tub electrical power (preview)**")
+                                fig_ht = go.Figure()
+                                fig_ht.add_scatter(x=P_ht.index, y=P_ht.values, mode="lines")
+                                fig_ht.update_layout(
+                                    height=160,
+                                    margin=dict(l=10, r=10, t=8, b=8),
+                                    xaxis_title="Time",
+                                    yaxis_title="kW",
+                                    showlegend=False,
+                                )
+                                st.plotly_chart(fig_ht, use_container_width=True)
+
+                                st.markdown("**Hot tub water temperature (preview)**")
+                                fig_T = go.Figure()
+                                fig_T.add_scatter(x=T_ht.index, y=T_ht.values, mode="lines")
+                                fig_T.add_hline(y=cfg["ht_idle_c"],   line_dash="dot")
+                                fig_T.add_hline(y=cfg["ht_target_c"], line_dash="dot")
+                                fig_T.update_layout(
+                                    height=160,
+                                    margin=dict(l=10, r=10, t=8, b=8),
+                                    xaxis_title="Time",
+                                    yaxis_title="°C",
+                                    showlegend=False,
+                                )
+                                st.plotly_chart(fig_T, use_container_width=True)
 
 
+
+                            # ======================================================
+                            # POOL HEATER – modeled as a big, cooler hot tub
+                            # ======================================================
+                            if cfg.get("pool_enabled", False):
+                                st.markdown("### 🏊 Pool heater settings")
+                                st.caption("Most pools use an air-to-water heat pump. This model assumes a pool heat pump with a COP 3.5.")
+
+
+                                c_tgt2, c_idle2 = st.columns(2)
+                                cfg["pool_target_c"] = c_tgt2.number_input(
+                                    "Target water temperature (°C)",
+                                    min_value=20.0,
+                                    max_value=35.0,
+                                    step=0.5,
+                                    value=float(cfg.get("pool_target_c", 28.0)),
+                                    key=f"{settings_id}_pool_Ttarget",
+                                )
+                                cfg["pool_idle_c"] = c_idle2.number_input(
+                                    "Idle temperature (°C)",
+                                    min_value=5.0,
+                                    max_value=35.0,
+                                    step=0.5,
+                                    value=float(cfg.get("pool_idle_c", 24.0)),
+                                    key=f"{settings_id}_pool_Tidle",
+                                )
+                                if cfg["pool_idle_c"] > cfg["pool_target_c"]:
+                                    cfg["pool_idle_c"] = cfg["pool_target_c"]
+
+                                c_vol2, c_pow2 = st.columns(2)
+                                cfg["pool_water_l"] = c_vol2.number_input(
+                                    "Water volume (L)",
+                                    min_value=5000.0,
+                                    max_value=80000.0,
+                                    step=500.0,
+                                    value=float(cfg.get("pool_water_l", 30000.0)),
+                                    key=f"{settings_id}_pool_vol",
+                                )
+                                cfg["pool_heater_kw"] = c_pow2.number_input(
+                                    "Heater capacity (kW, thermal)",
+                                    min_value=3.0,
+                                    max_value=40.0,
+                                    step=1.0,
+                                    value=float(cfg.get("pool_heater_kw", 15.0)),
+                                    key=f"{settings_id}_pool_kw",
+                                )
+
+                                ins_levels_pool = ["Good cover", "Average", "Poor"]
+                                ins_default_pool = cfg.get("pool_insulation", "Average")
+                                if ins_default_pool not in ins_levels_pool:
+                                    ins_default_pool = "Average"
+                                cfg["pool_insulation"] = st.selectbox(
+                                    "Cover / insulation level",
+                                    ins_levels_pool,
+                                    index=ins_levels_pool.index(ins_default_pool),
+                                    key=f"{settings_id}_pool_ins",
+                                )
+                                ins_p = cfg["pool_insulation"]
+                                ua_base_pool = 0.15
+                                if ins_p == "Good cover":
+                                    ua_pool = ua_base_pool * 0.6
+                                elif ins_p == "Poor":
+                                    ua_pool = ua_base_pool * 1.4
+                                else:
+                                    ua_pool = ua_base_pool
+
+                                # ---- estimated preheat time (ignoring losses) ----
+                                C_kwh_per_c_pool = max(cfg["pool_water_l"] * 1.16 / 1000.0, 1e-6)
+                                delta_c_pool = max(cfg["pool_target_c"] - cfg["pool_idle_c"], 0.0)
+                                E_pool = C_kwh_per_c_pool * delta_c_pool
+                                if cfg["pool_heater_kw"] > 0:
+                                    t_est_h_pool = E_pool / cfg["pool_heater_kw"]
+                                else:
+                                    t_est_h_pool = 0.0
+                                t_est_min_pool = int(round(t_est_h_pool * 60.0))
+                                st.caption(f"Rough time from idle to target ≈ {t_est_h_pool:.1f} h (ignoring losses).")
+
+
+
+                                st.markdown("**Use sessions**")
+                                pool_sessions = cfg.get("pool_sessions")
+                                if pool_sessions is None:
+                                    pool_sessions = []   # start empty the very first time
+                                del_idx_pool = None
+                                for j, sess in enumerate(pool_sessions):
+                                    c_s, c_d, c_del = st.columns([0.4, 0.4, 0.2])
+                                    with c_s:
+                                        s_t = c_s.time_input(
+                                            "Start",
+                                            value=sess.get("start", _time(8, 0)),
+                                            key=f"{settings_id}_pool_s_{j}",
+                                        )
+                                    with c_d:
+                                        dur = c_d.number_input(
+                                            "Duration (min)",
+                                            min_value=30,
+                                            max_value=1440,
+                                            step=30,
+                                            value=int(sess.get("duration_min", 480)),
+                                            key=f"{settings_id}_pool_d_{j}",
+                                        )
+                                    with c_del:
+                                        if c_del.button("🗑", key=f"{settings_id}_pool_del_{j}"):
+                                            del_idx_pool = j
+                                    sess["start"] = s_t
+                                    sess["duration_min"] = dur
+
+                                if del_idx_pool is not None:
+                                    pool_sessions.pop(del_idx_pool)
+                                    cfg["pool_sessions"] = pool_sessions
+                                    st.rerun()
+
+                                if st.button("➕ Add Use sessions", key=f"{settings_id}_pool_add"):
+                                    pool_sessions.append({"start": _time(13, 0), "duration_min": 60})
+                                    cfg["pool_sessions"] = pool_sessions
+                                    st.rerun()
+
+                                cfg["pool_sessions"] = pool_sessions
+
+                                pool_model = WeatherHotTub(
+                                    target_c=float(cfg["pool_target_c"]),
+                                    idle_c=float(cfg["pool_idle_c"]),
+                                    heater_kw=float(cfg["pool_heater_kw"]),
+                                    water_l=float(cfg["pool_water_l"]),
+                                    ua_kw_per_c=float(ua_pool),
+                                    sessions=pool_sessions,
+                                    use_outdoor_for_ambient=True,   # ✅ now we use Tout
+                                    indoor_ambient_c=21.0,          # unused when use_outdoor_for_ambient=True
+                                )
+                                # pool uses real outdoor temperature
+                                Q_pool_th, T_pool = pool_model.series_kw(idx_day, tout_day)
+                                cop_pool = 3.5
+
+                                P_pool = Q_pool_th / cop_pool
+                                P_pool.name = "P_pool_HP_kW"
+
+                                st.markdown("**Pool heater electrical power (preview)**")
+                                fig_pool = go.Figure()
+                                fig_pool.add_scatter(x=P_pool.index, y=P_pool.values, mode="lines")
+                                fig_pool.update_layout(
+                                    height=160,
+                                    margin=dict(l=10, r=10, t=8, b=8),
+                                    xaxis_title="Time",
+                                    yaxis_title="kW",
+                                    showlegend=False,
+                                )
+                                st.plotly_chart(fig_pool, use_container_width=True)
+
+                                st.markdown("**Pool water temperature (preview)**")
+                                fig_Tp = go.Figure()
+                                fig_Tp.add_scatter(x=T_pool.index, y=T_pool.values, mode="lines")
+                                fig_Tp.add_hline(y=cfg["pool_idle_c"],   line_dash="dot")
+                                fig_Tp.add_hline(y=cfg["pool_target_c"], line_dash="dot")
+                                fig_Tp.update_layout(
+                                    height=160,
+                                    margin=dict(l=10, r=10, t=8, b=8),
+                                    xaxis_title="Time",
+                                    yaxis_title="°C",
+                                    showlegend=False,
+                                )
+                                st.plotly_chart(fig_Tp, use_container_width=True)
+
+
+
+                           
+                            # ======================================================
+                            # AGGREGATED LEISURE PROFILE
+                            # ======================================================
+                            # start from zero series so we can always sum safely
+                            P_total = pd.Series(0.0, index=idx_day, name="P_leisure_kW")
+                            any_enabled = False
+
+                            if P_ht is not None:
+                                P_total = P_total + P_ht
+                                any_enabled = True
+                                cfg["hot_tub_profile_index"] = P_ht.index.astype(str).tolist()
+                                cfg["hot_tub_profile_kw"]    = P_ht.values.tolist()
+
+                            if P_pool is not None:
+                                P_total = P_total + P_pool
+                                any_enabled = True
+                                cfg["pool_profile_index"] = P_pool.index.astype(str).tolist()
+                                cfg["pool_profile_kw"]    = P_pool.values.tolist()
+
+                           
+                            if any_enabled:
+                                st.markdown("**Total leisure electrical power (all loads)**")
+                                fig_tot = go.Figure()
+                                fig_tot.add_scatter(x=P_total.index, y=P_total.values, mode="lines")
+                                fig_tot.update_layout(
+                                    height=180,
+                                    margin=dict(l=10, r=10, t=8, b=8),
+                                    xaxis_title="Time",
+                                    yaxis_title="kW",
+                                    showlegend=False,
+                                )
+                                st.plotly_chart(fig_tot, use_container_width=True)
+                            else:
+                                # no enabled loads → zero profile
+                                P_total = pd.Series(0.0, index=idx_day, name="P_leisure_kW")
+
+                            # main profile for this device (used by rest of the app)
+                            cfg["profile_index"] = P_total.index.astype(str).tolist()
+                            cfg["profile_kw"]    = P_total.values.tolist()
+
+                            if st.button("▲ Hide", key=f"{settings_id}_hide_leisure"):
+                                st.session_state[open_key] = False
+                                st.rerun()
+
+                    # =======================================================
+                    # EV CHARGING (special editor under outside)
+                    # =======================================================
+                    elif cat_key == "outside" and dev_type == "ev11":
+                        with st.container():
+                            st.markdown(
+                                "<hr style='border-top: 1px dotted #bfdbfe; margin:0.4rem 0;'/>",
+                                unsafe_allow_html=True,
+                            )
+                            st.markdown("**EV charging settings (01:00–06:00 window)**")
+
+                            # --- Charger & battery ---
+                            c_p, c_cap = st.columns(2)
+                            cfg["power_kw"] = c_p.number_input(
+                                "Charger power (kW)",
+                                min_value=1.0,
+                                max_value=50.0,
+                                step=0.5,
+                                value=float(cfg.get("power_kw", 11.0)),
+                                key=f"{settings_id}_ev_power",
+                            )
+                            cfg["capacity_kwh"] = c_cap.number_input(
+                                "EV battery capacity (kWh)",
+                                min_value=10.0,
+                                max_value=200.0,
+                                step=1.0,
+                                value=float(cfg.get("capacity_kwh", 75.0)),
+                                key=f"{settings_id}_ev_cap",
+                            )
+
+                            c_soc_a, c_soc_t = st.columns(2)
+                            cfg["soc_arrive"] = c_soc_a.number_input(
+                                "Arrival SOC (%)",
+                                min_value=0.0,
+                                max_value=100.0,
+                                step=5.0,
+                                value=float(cfg.get("soc_arrive", 20.0)),
+                                key=f"{settings_id}_ev_soc_a",
+                            )
+                            cfg["soc_target"] = c_soc_t.number_input(
+                                "Target SOC at departure (%)",
+                                min_value=0.0,
+                                max_value=100.0,
+                                step=5.0,
+                                value=float(cfg.get("soc_target", 80.0)),
+                                key=f"{settings_id}_ev_soc_t",
+                            )
+                            if cfg["soc_target"] < cfg["soc_arrive"]:
+                                cfg["soc_target"] = cfg["soc_arrive"]
+
+                            # Needed energy and duration (minutes)
+                            delta_soc = max(cfg["soc_target"] - cfg["soc_arrive"], 0.0) / 100.0
+                            energy_need = delta_soc * cfg["capacity_kwh"]  # kWh
+                            if cfg["power_kw"] > 0 and energy_need > 0:
+                                duration_min = int(np.ceil(energy_need * 60.0 / cfg["power_kw"]))
+                            else:
+                                duration_min = 0
+                            cfg["duration_min"] = duration_min
+
+                            st.caption(
+                                f"Energy needed ≈ **{energy_need:.1f} kWh**, "
+                                f"charging time ≈ **{duration_min} min** at {cfg['power_kw']:.1f} kW."
+                            )
+
+                            # Cost/CO2 preference
+                            cfg["w_cost"] = float(
+                                st.slider(
+                                    "Preference (0 = CO₂ only, 1 = cost only)",
+                                    min_value=0.0,
+                                    max_value=1.0,
+                                    step=0.05,
+                                    value=float(cfg.get("w_cost", 1)),
+                                    key=f"{settings_id}_ev_w_cost",
+                                )
+                            )
+
+                            # Single interval in cfg
+                            intervals = cfg.setdefault("intervals", [])
+                            if not intervals:
+                                intervals.append(
+                                    {"start": _time(1, 0), "end": _time(6, 0)}
+                                )
+                            elif len(intervals) > 1:
+                                intervals[:] = intervals[:1]
+
+                            current_iv = intervals[0]
+
+                            st.caption("Current scheduled interval (single continuous block):")
+                            c_a, c_b = st.columns(2)
+                            with c_a:
+                                start_time = c_a.time_input(
+                                    "Start (01:00–06:00 preferred)",
+                                    value=current_iv.get("start", _time(1, 0)),
+                                    key=f"{settings_id}_ev_start",
+                                )
+
+                            # recompute end from duration
+                            if duration_min > 0:
+                                dt0 = datetime.combine(date.today(), start_time)
+                                dt1 = dt0 + timedelta(minutes=duration_min)
+                                end_time = dt1.time()
+                            else:
+                                end_time = current_iv.get("end", _time(1, 30))
+
+                            with c_b:
+                                st.time_input(
+                                    "End (computed)",
+                                    value=end_time,
+                                    key=f"{settings_id}_ev_end_display",
+                                    disabled=True,
+                                )
+
+                            current_iv["start"], current_iv["end"] = start_time, end_time
+
+                            # Suggest button (search only 01:00–06:00 using price/CO₂)
+                            if st.button(
+                                "💡 Suggest cheapest/cleanest in 01:00–06:00",
+                                key=f"{settings_id}_ev_suggest",
+                            ):
+                                if duration_min <= 0:
+                                    st.warning("No energy needed (arrival SOC ≥ target SOC).")
+                                else:
+                                    interval = suggest_best_interval_for_ev(
+                                        duration_min=duration_min,
+                                        w_cost=cfg["w_cost"],
+                                        window_start_min=60,   # 01:00
+                                        window_end_min=360,    # 06:00
+                                    )
+                                    if interval is None:
+                                        st.warning(
+                                            "No price/CO₂ data or no selected day. "
+                                            "Please select a day and fetch data on page 1 first."
+                                        )
+                                    else:
+                                        intervals[0] = interval
+                                        st.success(
+                                            f"Suggested interval: "
+                                            f"{interval['start'].strftime('%H:%M')}–"
+                                            f"{interval['end'].strftime('%H:%M')}"
+                                        )
+                                        st.rerun()
+
+                            # Preview profile (kW)
+                            st.markdown("**Daily EV charging profile (preview)**")
+                            prof_ev = build_minute_profile(
+                                power_w=cfg["power_kw"] * 1000.0,  # W input
+                                intervals=intervals,
+                                step_min=1,
+                            )
+                            cfg["profile_index"] = prof_ev.index.astype(str).tolist()
+                            cfg["profile_kw"] = prof_ev.values.tolist()
+
+                            fig_ev = go.Figure()
+                            fig_ev.add_scatter(
+                                x=prof_ev.index,
+                                y=prof_ev.values,
+                                mode="lines",
+                                name="P_EV_kW",
+                            )
+                            fig_ev.update_layout(
+                                height=180,
+                                margin=dict(l=10, r=10, t=10, b=8),
+                                xaxis_title="Time",
+                                yaxis_title="kW",
+                                showlegend=False,
+                            )
+                            st.plotly_chart(fig_ev, use_container_width=True)
+
+                            if st.button("▲ Hide details", key=f"{settings_id}_hide_ev"):
+                                st.session_state[open_key] = False
+                                st.rerun()
+
+                    #########################################################
+                    # E-BIKE CHARGER (simpler EV)
+                    # =======================================================
+                    elif cat_key == "outside" and dev_type == "ebike":
+                        with st.container():
+                            st.markdown(
+                                "<hr style='border-top: 1px dotted #bbf7d0; margin:0.4rem 0;'/>",
+                                unsafe_allow_html=True,
+                            )
+                            st.markdown("**E-bike charging settings**")
+
+                            # --- Charger & battery (smaller by default) ---
+                            c_p, c_cap = st.columns(2)
+                            cfg["power_kw"] = c_p.number_input(
+                                "Charger power (kW)",
+                                min_value=0.1,
+                                max_value=5.0,
+                                step=0.1,
+                                value=float(cfg.get("power_kw", 0.5)),   # e-bike: 500 W default
+                                key=f"{settings_id}_ebike_power",
+                            )
+                            cfg["capacity_kwh"] = c_cap.number_input(
+                                "Battery capacity (kWh)",
+                                min_value=0.2,
+                                max_value=5.0,
+                                step=0.1,
+                                value=float(cfg.get("capacity_kwh", 1.0)),  # e-bike: ~1 kWh
+                                key=f"{settings_id}_ebike_cap",
+                            )
+
+                            c_soc_a, c_soc_t = st.columns(2)
+                            cfg["soc_arrive"] = c_soc_a.number_input(
+                                "Arrival SOC (%)",
+                                min_value=0.0,
+                                max_value=100.0,
+                                step=5.0,
+                                value=float(cfg.get("soc_arrive", 40.0)),
+                                key=f"{settings_id}_ebike_soc_a",
+                            )
+                            cfg["soc_target"] = c_soc_t.number_input(
+                                "Target SOC at departure (%)",
+                                min_value=0.0,
+                                max_value=100.0,
+                                step=5.0,
+                                value=float(cfg.get("soc_target", 100.0)),
+                                key=f"{settings_id}_ebike_soc_t",
+                            )
+                            if cfg["soc_target"] < cfg["soc_arrive"]:
+                                cfg["soc_target"] = cfg["soc_arrive"]
+
+                            # Needed energy and duration (minutes)
+                            delta_soc   = max(cfg["soc_target"] - cfg["soc_arrive"], 0.0) / 100.0
+                            energy_need = delta_soc * cfg["capacity_kwh"]  # kWh
+                            if cfg["power_kw"] > 0 and energy_need > 0:
+                                duration_min = int(np.ceil(energy_need * 60.0 / cfg["power_kw"]))
+                            else:
+                                duration_min = 0
+                            cfg["duration_min"] = duration_min
+
+                            st.caption(
+                                f"Energy needed ≈ **{energy_need:.1f} kWh**, "
+                                f"charging time ≈ **{duration_min} min** at {cfg['power_kw']:.1f} kW."
+                            )
+
+                            # Cost/CO2 preference (same as EV)
+                            cfg["w_cost"] = float(
+                                st.slider(
+                                    "Preference (0 = CO₂ only, 1 = cost only)",
+                                    min_value=0.0,
+                                    max_value=1.0,
+                                    step=0.05,
+                                    value=float(cfg.get("w_cost", 1)),
+                                    key=f"{settings_id}_ebike_w_cost",
+                                )
+                            )
+
+                            # Single interval in cfg
+                            # For e-bike I assume an evening window by default (19:00–23:00).
+                            intervals = cfg.setdefault("intervals", [])
+                            if not intervals:
+                                intervals.append(
+                                    {"start": _time(1, 0), "end": _time(6, 0)}
+                                )
+                            elif len(intervals) > 1:
+                                intervals[:] = intervals[:1]
+
+                            current_iv = intervals[0]
+
+                            st.caption("Current scheduled interval (single continuous block):")
+                            c_a, c_b = st.columns(2)
+                            with c_a:
+                                start_time = c_a.time_input(
+                                    "Start",
+                                    value=current_iv.get("start", _time(1, 0)),
+                                    key=f"{settings_id}_ebike_start",
+                                )
+
+                            # recompute end from duration
+                            if duration_min > 0:
+                                dt0 = datetime.combine(date.today(), start_time)
+                                dt1 = dt0 + timedelta(minutes=duration_min)
+                                end_time = dt1.time()
+                            else:
+                                end_time = current_iv.get("end", _time(6, 0))
+
+                            with c_b:
+                                st.time_input(
+                                    "End (computed)",
+                                    value=end_time,
+                                    key=f"{settings_id}_ebike_end_display",
+                                    disabled=True,
+                                )
+
+                            current_iv["start"], current_iv["end"] = start_time, end_time
+
+                            # Optional: reuse same suggestion function as car EV,
+                            # but with a different window (e.g. 17:00–23:00).
+                            if st.button(
+                                "💡 Suggest cheapest/cleanest this evening (1:00–6:00)",
+                                key=f"{settings_id}_ebike_suggest",
+                            ):
+                                if duration_min <= 0:
+                                    st.warning("No energy needed (arrival SOC ≥ target SOC).")
+                                else:
+                                    interval = suggest_best_interval_for_ev(
+                                        duration_min=duration_min,
+                                        w_cost=cfg["w_cost"],
+                                        window_start_min=1* 60,  # 17:00
+                                        window_end_min=6 * 60,    # 23:00
+                                    )
+                                    if interval is None:
+                                        st.warning(
+                                            "No price/CO₂ data or no selected day. "
+                                            "Please select a day and fetch data on page 1 first."
+                                        )
+                                    else:
+                                        intervals[0] = interval
+                                        st.success(
+                                            f"Suggested interval: "
+                                            f"{interval['start'].strftime('%H:%M')}–"
+                                            f"{interval['end'].strftime('%H:%M')}"
+                                        )
+                                        st.rerun()
+
+                            # Preview profile (kW)
+                            st.markdown("**Daily E-bike charging profile (preview)**")
+                            prof_eb = build_minute_profile(
+                                power_w=cfg["power_kw"] * 1000.0,
+                                intervals=intervals,
+                                step_min=1,
+                            )
+                            cfg["profile_index"] = prof_eb.index.astype(str).tolist()
+                            cfg["profile_kw"] = prof_eb.values.tolist()
+
+                            fig_eb = go.Figure()
+                            fig_eb.add_scatter(
+                                x=prof_eb.index,
+                                y=prof_eb.values,
+                                mode="lines",
+                                name="P_Ebike_kW",
+                            )
+                            fig_eb.update_layout(
+                                height=180,
+                                margin=dict(l=10, r=10, t=10, b=8),
+                                xaxis_title="Time",
+                                yaxis_title="kW",
+                                showlegend=False,
+                            )
+                            st.plotly_chart(fig_eb, use_container_width=True)
+
+                            if st.button("▲ Hide details", key=f"{settings_id}_hide_ebike"):
+                                st.session_state[open_key] = False
+                                st.rerun()
+
+                    #########################################################
+                    # =======================================================
+                    # PV SYSTEM – simple generation preview
+                    # =======================================================
+                    elif cat_key == "gen_store":
+                        if dev_type == "pv":
+                            st.markdown(
+                                """
+                                <hr style="border: 0; border-top: 1px dotted #bbf7d0; margin: 0.4rem 0;" />
+                                """,
+                                unsafe_allow_html=True,
+                            )
+
+                            st.markdown("**PV system settings**")
+
+                            # --- Basic sizing ---
+                            c_wp, c_np = st.columns(2)
+                            cfg["module_wp"] = c_wp.number_input(
+                                "Module nameplate (Wp)",
+                                min_value=50.0,
+                                max_value=1000.0,
+                                step=10.0,
+                                value=float(cfg.get("module_wp", 400.0)),
+                                key=f"{settings_id}_pv_mod_wp",
+                            )
+                            cfg["n_panels"] = c_np.number_input(
+                                "Number of panels",
+                                min_value=0,
+                                max_value=2000,
+                                step=1,
+                                value=int(cfg.get("n_panels", 16)),
+                                key=f"{settings_id}_pv_n_panels",
+                            )
+                            kwp = (cfg["module_wp"] * cfg["n_panels"]) / 1000.0
+                            st.caption(f"Total DC size: **{kwp:.2f} kWp**")
+
+                            # --- Orientation & losses ---
+                            c_tilt, c_az = st.columns(2)
+                            cfg["tilt"] = c_tilt.number_input(
+                                "Tilt (°)",
+                                min_value=0.0,
+                                max_value=90.0,
+                                step=1.0,
+                                value=float(cfg.get("tilt", 30.0)),
+                                key=f"{settings_id}_pv_tilt",
+                            )
+                            cfg["azimuth"] = c_az.number_input(
+                                "Azimuth (°; 180 = South)",
+                                min_value=0.0,
+                                max_value=360.0,
+                                step=1.0,
+                                value=float(cfg.get("azimuth", 180.0)),
+                                key=f"{settings_id}_pv_az",
+                            )
+
+                            cfg["loss_frac"] = st.number_input(
+                                "System losses (fraction)",
+                                min_value=0.0,
+                                max_value=0.5,
+                                step=0.01,
+                                value=float(cfg.get("loss_frac", 0.14)),
+                                key=f"{settings_id}_pv_loss",
+                            )
+
+                            # --- Build 1-minute index for the selected day ---
+                            from datetime import timedelta as _td
+
+                            sel_day = st.session_state.get("day")
+                            if sel_day is not None:
+                                day_start = pd.Timestamp(sel_day)
+                                day_end   = day_start + _td(days=1)
+                                idx_pv = pd.date_range(
+                                    day_start,
+                                    day_end,
+                                    freq="min",
+                                    inclusive="left",
+                                )
+                            else:
+                                # fallback: synthetic day
+                                idx_pv = pd.date_range(
+                                    "2025-01-10 00:00",
+                                    periods=24 * 60,
+                                    freq="min",
+                                )
+
+                            # --- Use real weather if available, otherwise synthetic ---
+                            pv_series = None
+                            if (
+                                "weather_hr" in st.session_state
+                                and isinstance(st.session_state["weather_hr"], pd.DataFrame)
+                                and not st.session_state["weather_hr"].empty
+                                and kwp > 0
+                            ):
+                                weather_hr = st.session_state["weather_hr"]
+                                try:
+                                    pv_series = pv_from_weather_modelchain_from_df(
+                                        idx_min=idx_pv,
+                                        dfh=weather_hr,
+                                        lat=float(st.session_state.get("geo_lat", 57.0488)),
+                                        lon=float(st.session_state.get("geo_lon", 9.9217)),
+                                        kwp=kwp,
+                                        tilt_deg=float(cfg["tilt"]),
+                                        az_deg=float(cfg["azimuth"]),
+                                        sys_loss_frac=float(cfg["loss_frac"]),
+                                    )
+                                    st.caption("Using fetched weather for PV preview.")
+                                except Exception as e:
+                                    st.warning(f"PV preview using weather failed: {e}. Falling back to synthetic curve.")
+                                    pv_series = None
+
+                            if pv_series is None:
+                                # Simple synthetic bell-shaped PV profile for preview only
+                                hours = idx_pv.hour + idx_pv.minute / 60.0
+                                shape = np.maximum(0.0, np.sin(np.pi * (hours - 6.0) / 12.0))
+                                pv_series = pd.Series(kwp * shape, index=idx_pv, name="pv_kw")
+                                st.caption("No usable weather data – showing a synthetic PV curve for preview.")
+
+                            # Store profile in cfg (kW, 1-min)
+                            cfg["profile_index"] = pv_series.index.astype(str).tolist()
+                            cfg["profile_kw"]    = pv_series.values.tolist()
+
+                            # --- Plot PV preview ---
+                            st.markdown("<div style='height:0.75rem'></div>", unsafe_allow_html=True)
+                            st.markdown("**PV power for selected day (preview)**")
+
+                            fig_pv = go.Figure()
+                            fig_pv.add_scatter(
+                                x=pv_series.index,
+                                y=pv_series.values,
+                                mode="lines",
+                                name="P_PV_kW",
+                            )
+                            fig_pv.update_layout(
+                                height=180,
+                                margin=dict(l=10, r=10, t=10, b=8),
+                                xaxis_title="Time",
+                                yaxis_title="kW",
+                                showlegend=False,
+                            )
+                            st.plotly_chart(fig_pv, use_container_width=True, key=f"{settings_id}_pv_fig")
+
+                            # Hide button
+                            if st.button("▲ Hide details", key=f"{settings_id}_hide_pv"):
+                                st.session_state[open_key] = False
+                                st.rerun()
+
+                        ###
+                        else:
+                            with st.container():
+                                    st.markdown(
+                                        "🚧 **Model not implemented yet**  \n"
+                                        "This component will be supported in a future "
+                                        "version of the app. For now, it does not "
+                                        "affect your daily load or PV coverage.",
+                                    )
+                                    if st.button("▲ Hide", key=f"{settings_id}_hide_future"):
+                                        st.session_state[open_key] = False
+                                        st.rerun()
+                                    st.markdown("</div>", unsafe_allow_html=True)
+
+
+                    # =======================================================
+                    # B) Generic simple editor for all other categories
+                    # =======================================================
                     else:
-                        # other categories – placeholder for now
-                        st.info("Settings for this device type will be added later.")
-                        if st.button("▲ Hide details", key=f"{settings_id}_hide_other"):
-                            st.session_state[f"settings_open_{settings_id}"] = False
-                            st.rerun()
+                        with st.container():
+                            st.markdown(
+                                "<div style='border:1px solid #ddd;border-radius:4px;padding:0.5rem;'>",
+                                unsafe_allow_html=True,
+                            )
 
-                    # bottom dashed line
-                    st.markdown(
-                        "<hr style='border-top: 1px dashed #bbb;'/>",
-                        unsafe_allow_html=True,
-                    )
+                            c_p, c_s, c_d = st.columns(3)
+                            cfg["power_kw"] = c_p.number_input(
+                                "Power (kW)",
+                                min_value=0.0,
+                                max_value=50.0,
+                                step=0.1,
+                                value=float(cfg.get("power_kw", 0.5)),
+                                key=f"p_{full_key}",
+                            )
+                            cfg["start"] = c_s.time_input(
+                                "Start",
+                                value=cfg.get("start", _time(18, 0)),
+                                key=f"start_{full_key}",
+                            )
+                            cfg["duration_min"] = int(
+                                c_d.number_input(
+                                    "Duration (min)",
+                                    min_value=0,
+                                    max_value=1440,
+                                    step=15,
+                                    value=int(cfg.get("duration_min", 60)),
+                                    key=f"dur_{full_key}",
+                                )
+                            )
 
-        else:
-            st.caption("No devices in this group yet.")
+                            st.caption(
+                                "These are simplified settings. "
+                                "You can later link them to detailed models (HP, DHW, EV, etc.)."
+                            )
 
-        st.markdown("")  # small gap
+                            if st.button("▲ Hide", key=f"hide_{full_key}"):
+                                st.session_state[open_key] = False
+                                st.rerun()
 
-        # Add new device
-        c_add1, c_add2, c_add3 = st.columns([0.4, 0.4, 0.2])
-        with c_add1:
-            label = st.selectbox(
-                "Type",
-                list(type_choices.keys()),
-                key=f"{cat_key}_new_type",
-            )
-        with c_add2:
-            default_name = type_choices[label].replace("_", " ").title()
-            name = st.text_input(
-                "Name",
-                value=default_name,
-                key=f"{cat_key}_new_name",
-            )
-        with c_add3:
-            add_clicked = st.button("➕", key=f"{cat_key}_add_btn")
+                            st.markdown("</div>", unsafe_allow_html=True)
 
-        max_cap = MAX_PER_CATEGORY.get(cat_key, 99)
-        if add_clicked:
-            if len(dev_list) >= max_cap:
-                st.info(
-                    f"Cannot add more than {max_cap} devices in this group. "
-                    "Please delete one before adding another."
-                )
-            else:
-                new_id = f"{cat_key}_{len(dev_list)+1}"
-                dev_list.append(
-                    {"id": new_id, "type": type_choices[label], "name": name}
-                )
-                st.rerun()
+        st.markdown("")  # gap under category
 
-        devices[cat_key] = dev_list
 
-    
-    # ------------------------------------------------------------------ #
-    # LEFT + RIGHT COLUMNS
-    # ------------------------------------------------------------------ #
-    left_col, right_col = st.columns([1.5, 2])
 
-    # ---------------- LEFT: device lists ----------------
-    with left_col:
-        st.markdown("### Choose devices")
 
-        render_category_ui(
-            "elec_fixed",
-            "1. Household electrical – fixed",
-            {
-                "Lights": "lights",
-                "Range hood": "hood",
-                "Refrigerator": "fridge",
-                "Other fixed load": "other",
-            },
+    # Render all categories
+    render_category("elec_fixed")
+    render_category("elec_flex")
+    render_category("thermal")
+    render_category("outside")
+    render_category("gen_store")
+
+    # ---- build and show house layout with devices ----
+    layout_fig = build_house_layout_figure(sel, cfgs)
+    layout_placeholder.plotly_chart(layout_fig, use_container_width=True, config={"responsive": True})
+
+
+    # ---- build daily profiles for all selected devices ----
+    idx, device_traces, total = compute_daily_profiles(sel, cfgs)
+
+    figp = go.Figure()
+
+    # ---------------------------------------------------
+    # 1) Add all LOAD traces (everything except PV)
+    # ---------------------------------------------------
+    for full_key, series in device_traces.items():
+        if series.max() <= 0:
+            continue
+
+        cat_key, dev_type = full_key.split(":", 1)
+
+        # skip PV here – we add it separately as shaded area
+        if cat_key == "gen_store" and dev_type == "pv":
+            continue
+
+        label = DEVICE_LABEL_MAP.get(full_key, full_key)
+        cfg = cfgs.get(full_key, {})
+        num = int(cfg.get("num_devices", 1))
+        if num > 1 and not full_key.startswith("other"):
+            label = f"{label} (x{num})"
+
+        figp.add_scatter(
+            x=idx,
+            y=series.values,
+            mode="lines",
+            name=label,
         )
 
-        st.markdown("---")
+    # ---------------------------------------------------
+    # 2) Add PV as a SHADED AREA (generation)
+    # ---------------------------------------------------
+    for full_key, series in device_traces.items():
+        cat_key, dev_type = full_key.split(":", 1)
+        if not (cat_key == "gen_store" and dev_type == "pv"):
+            continue
+        if series.max() <= 0:
+            continue
 
-        render_category_ui(
-            "elec_flex",
-            "1b. Household electrical – flexible",
-            {
-                "Washing machine": "wm",
-                "Dishwasher": "dw",
-                "Dryer": "dryer",
-                "Other flexible load": "other",
-            },
+        label = DEVICE_LABEL_MAP.get(full_key, "PV generation")
+
+        figp.add_scatter(
+            x=idx,
+            y=series.values,
+            mode="lines",
+            name=label,
+            fill="tozeroy",      # ✅ fill area to zero
+            line=dict(width=1),  # thin line; area does the visual work
         )
 
-        st.markdown("---")
+    # ---------------------------------------------------
+    # 3) Add TOTAL LOAD (consumption only, PV excluded in compute_daily_profiles)
+    # ---------------------------------------------------
+    figp.add_scatter(
+        x=idx,
+        y=total.values,
+        mode="lines",
+        name="Total load",
+        line=dict(width=3),
+    )
 
-        render_category_ui(
-            "thermal",
-            "2. Household thermal",
-            {
-                "Heat pump": "hp",
-                "Electric heater": "e_heater",
-                "Hot tub": "hot_tub",
-                "DHW tank": "dhw",
-            },
-        )
-
-        st.markdown("---")
-
-        render_category_ui(
-            "gen_store",
-            "3. Generation & storage",
-            {
-                "PV system": "pv",
-                "Battery": "battery",
-                "Fuel cell": "fuel_cell",
-            },
-        )
-
-        st.markdown("---")
-
-        render_category_ui(
-            "ev",
-            "4. Outside",
-            {
-                "EV charger": "ev",
-            },
-        )
-
-    # ------------------------------------------------------------------ #
-    # Derive a simple devices_enabled dict for compatibility
-    # ------------------------------------------------------------------ #
-    enabled = {
-        "lights": False,
-        "hood": False,
-        "fridge": False,
-        "wm": False,
-        "dw": False,
-        "dryer": False,
-        "hp": False,
-        "e_heater": False,
-        "hot_tub": False,
-        "pv": False,
-        "battery": False,
-        "fuel_cell": False,
-        "diesel": False,
-        "ev": False,
-    }
-    for dev_list in devices.values():
-        for d in dev_list:
-            t = d["type"]
-            if t in enabled:
-                enabled[t] = True
-    st.session_state["devices_enabled"] = enabled
-    st.session_state["device_configs"] = device_configs  # <<< write back configs
-
-    # ---------------- RIGHT: house drawing ----------------
-    with right_col:
-        st.markdown("### House layout")
-
-        fig = go.Figure()
-        shapes = []
-
-        # HOUSE BODY
-        shapes.append(
-            dict(
-                type="rect",
-                x0=1, y0=2, x1=9, y1=7,
-                line=dict(width=2),
-                fillcolor="rgba(245,245,245,0.8)",
-            )
-        )
-
-        # ROOF = Generation & storage
-        roof_path = "M 1 7 L 5 9 L 9 7 Z"
-        shapes.append(
-            dict(
-                type="path",
-                path=roof_path,
-                line=dict(width=2),
-                fillcolor="rgba(180, 255, 180, 0.5)",
-            )
-        )
-
-        # Electrical zone (upper half)
-        shapes.append(
-            dict(
-                type="rect",
-                x0=1.05, y0=4.0, x1=8.95, y1=6.95,
-                line=dict(width=1, dash="dot"),
-                fillcolor="rgba(210, 225, 255, 0.4)",
-            )
-        )
-        # Left = fixed
-        shapes.append(
-            dict(
-                type="rect",
-                x0=1.1, y0=4.1, x1=4.8, y1=6.85,
-                line=dict(width=1, dash="dot"),
-                fillcolor="rgba(150, 200, 255, 0.4)",
-            )
-        )
-        # Right = flexible
-        shapes.append(
-            dict(
-                type="rect",
-                x0=5.2, y0=4.1, x1=8.85, y1=6.85,
-                line=dict(width=1, dash="dot"),
-                fillcolor="rgba(255, 235, 170, 0.4)",
-            )
-        )
-
-        # Thermal zone (lower half)
-        shapes.append(
-            dict(
-                type="rect",
-                x0=1.05, y0=2.05, x1=8.95, y1=3.95,
-                line=dict(width=1, dash="dot"),
-                fillcolor="rgba(255, 190, 190, 0.45)",
-            )
-        )
-
-        # EV outside
-        shapes.append(
-            dict(
-                type="rect",
-                x0=9.2, y0=1.95, x1=10.1, y1=3.02,
-                line=dict(width=1.5),
-                fillcolor="rgba(250,250,250,0.9)",
-            )
-        )
-
-        fig.update_layout(shapes=shapes)
-
-        # ---- Zone labels ----
-        annotations = [
-            dict(x=2.0, y=4.3, text="Electrical (fixed)",    showarrow=False, font=dict(size=10)),
-            dict(x=6.2, y=4.3, text="Electrical (flexible)", showarrow=False, font=dict(size=10)),
-            dict(x=1.8, y=2.2, text="Thermal",               showarrow=False, font=dict(size=10)),
-            dict(x=5.0, y=7.2, text="Generation & Storage",  showarrow=False, font=dict(size=11)),
-        ]
-
-        # ---- Device positions per zone ----
-        def add_zone_devices_grid(
-            dev_list,
-            base_x,
-            base_y,
-            max_cols,
-            max_rows,
-            dx,
-            dy,
-        ):
-            capacity = max_cols * max_rows
-            for j, dev in enumerate(dev_list[:capacity]):
-                col = j % max_cols
-                row = j // max_cols
-                x = base_x + col * dx
-                y = base_y - row * dy
-                icon = TYPE_ICONS.get(dev["type"], "🔌")
-                label = f"{icon} {dev['name']}"
-                annotations.append(
-                    dict(
-                        x=x,
-                        y=y,
-                        text=label,
-                        showarrow=False,
-                        font=dict(size=11),
-                        bgcolor="rgba(255,255,255,0.9)",
-                        bordercolor="rgba(0,0,0,0.25)",
-                        borderwidth=1,
-                        borderpad=2,
-                        xanchor="center",
-                        yanchor="middle",
-                    )
-                )
-
-        # 1) Electrical fixed – 5 x 4 grid
-        add_zone_devices_grid(
-            devices["elec_fixed"],
-            base_x=1.6,
-            base_y=6.5,
-            max_cols=4,
-            max_rows=4,
-            dx=0.91,
-            dy=0.6,
-        )
-
-        # 2) Electrical flexible – 5 x 4 grid
-        add_zone_devices_grid(
-            devices["elec_flex"],
-            base_x=5.65,
-            base_y=6.5,
-            max_cols=4,
-            max_rows=4,
-            dx=0.91,
-            dy=0.6,
-        )
-        # 3) Thermal – 4 x 4 grid
-        add_zone_devices_grid(
-            devices["thermal"],
-            base_x=3.0,
-            base_y=3.7,
-            max_cols=4,
-            max_rows=4,
-            dx=1.3,
-            dy=0.45,
-        )
-        # 4) Generation & storage – triangular layout (2 + 4 + 6 = 12 slots)
-        gen_slots = [
-            # top row (2)
-            (4.6, 8.4),
-            (5.4, 8.4),
-            # middle row (4)
-            (3.9, 8.0),
-            (4.6, 8.0),
-            (5.4, 8.0),
-            (6.2, 8.0),
-            # bottom row (6)
-            (2.9, 7.5),
-            (3.7, 7.5),
-            (4.5, 7.5),
-            (5.3, 7.5),
-            (6.1, 7.5),
-            (7.0, 7.5),
-        ]
-
-        for j, dev in enumerate(devices["gen_store"][: len(gen_slots)]):
-            x, y = gen_slots[j]
-            icon = TYPE_ICONS.get(dev["type"], "🔌")
-            label = f"{icon} {dev['name']}"
-            annotations.append(
-                dict(
-                    x=x,
-                    y=y,
-                    text=label,
-                    showarrow=False,
-                    font=dict(size=11),
-                    bgcolor="rgba(255,255,255,0.9)",
-                    bordercolor="rgba(0,0,0,0.25)",
-                    borderwidth=1,
-                    borderpad=2,
-                    xanchor="center",
-                    yanchor="middle",
-                )
-            )
-        # 5) EV – up to 2 stacked outside
-        ev_slots = [
-            (9.65, 2.7),
-            (9.65, 2.2),
-        ]
-        for j, dev in enumerate(devices["ev"][: len(ev_slots)]):
-            x, y = ev_slots[j]
-            icon = TYPE_ICONS.get(dev["type"], "🚗")
-            label = f"{icon} {dev['name']}"
-            annotations.append(
-                dict(
-                    x=x,
-                    y=y,
-                    text=label,
-                    showarrow=False,
-                    font=dict(size=11),
-                    bgcolor="rgba(255,255,255,0.9)",
-                    bordercolor="rgba(0,0,0,0.25)",
-                    borderwidth=1,
-                    borderpad=2,
-                    xanchor="center",
-                    yanchor="middle",
-                )
-            )
-
-       
-
-        fig.update_layout(
-            annotations=annotations,
-            xaxis=dict(visible=False, range=[0, 11]),
-            yaxis=dict(visible=False, range=[0, 10]),
-            margin=dict(l=10, r=10, t=10, b=10),
-            template="plotly_white",
-            autosize=True,
-            height=None,
-        )
-
-        fig.update_yaxes(scaleanchor=None)
-        st.plotly_chart(fig, use_container_width=True, config={"responsive": True})
-        # ------------------------------------------------------------------ #
-        # Combined daily profiles: fixed, flexible, EV, total load & PV
-        # ------------------------------------------------------------------ #
-        # ---------------------------------------------------------------------------
-        # Combined per-minute electric load and PV generation for all devices
-        # ---------------------------------------------------------------------------
-        st.markdown("---")
-        st.markdown("### Daily power profiles – per device")
-
-        device_configs = st.session_state.get("device_configs", {})
-        devices        = st.session_state.get("devices", {})
-
-        series_by_device = {}
-        type_counter = {}  
-        series_meta = {}
-
-        for cat_key, dev_list in devices.items():
-            for dev in dev_list:
-                settings_id = f"{cat_key}_{dev['id']}"
-                cfg = device_configs.get(settings_id)
-                if not cfg:
-                    continue
-
-                if "profile_index" not in cfg or "profile_kw" not in cfg:
-                    # this device hasn’t generated a preview yet
-                    continue
-
-                try:
-                    idx = pd.to_datetime(cfg["profile_index"])
-                    vals = np.asarray(cfg["profile_kw"], dtype=float)
-                    if len(idx) != len(vals) or len(idx) == 0:
-                        continue
-                except Exception:
-                    continue
-
-                # ---- build unique label ----
-                dev_type = dev["type"]
-                type_counter[dev_type] = type_counter.get(dev_type, 0) + 1
-                icon = TYPE_ICONS.get(dev_type, "🔌")
-                if type_counter[dev_type] == 1:
-                    label = f"{icon} {dev['name']}"
-                else:
-                    label = f"{icon} {dev['name']} #{type_counter[dev_type]}"
-
-                s = pd.Series(vals, index=idx, name=label)
-                s = normalize_to_dummy_day(s)   # <<< normalize to 2000-01-01, keep only HH:MM
-                series_by_device[settings_id] = s
-                series_meta[settings_id] = dev_type
+    # ---------------------------------------------------
+    # 4) Layout – legend UNDER the figure
+    # ---------------------------------------------------
+    figp.update_layout(
+        height=280,
+        margin=dict(l=10, r=10, t=10, b=80),  # extra bottom space for legend
+        xaxis_title="Time of day",
+        yaxis_title="kW",
+        legend=dict(
+            orientation="h",         # horizontal legend
+            yanchor="top",
+            y=-0.8,                 # move below plot area
+            xanchor="center",
+            x=0.5,
+            itemclick="toggleothers",    # keep your behaviour
+            itemdoubleclick="toggle",
+        ),
+    )
 
 
-        if not series_by_device:
-            st.caption("No device profiles stored yet – open a device’s settings to generate its preview.")
-        else:
-            fig_all = go.Figure()
-            all_load_series = []
-            pv_series_list  = []
+    # update the placeholder that we created in top_right
+    profile_placeholder.plotly_chart(figp, use_container_width=True)
 
-            # --- Separate PV vs non-PV ---
-            for sid, s in series_by_device.items():
-                d_type = series_meta.get(sid, "")
-
-                if d_type == "pv":
-                    pv_series_list.append(s)
-                else:
-                    all_load_series.append(s)
-                    fig_all.add_scatter(
-                        x=s.index,
-                        y=s.values,
-                        mode="lines",
-                        name=s.name,
-                    )
-
-            # --- Total load (only non-PV devices) ---
-            if all_load_series:
-                total_load = all_load_series[0].copy()
-                for s in all_load_series[1:]:
-                    total_load = total_load.add(s, fill_value=0.0)
-                total_load.name = "Total load"
-                fig_all.add_scatter(
-                    x=total_load.index,
-                    y=total_load.values,
-                    mode="lines",
-                    name="Total load",
-                    line=dict(width=3),
-                )
+    # write back to session
+    st.session_state["device_selection"] = sel
+    st.session_state["device_configs"] = cfgs
 
 
-
-            # --- Aggregate PV and plot as area ---
-            if pv_series_list:
-                pv_total = pv_series_list[0].copy()
-                for s in pv_series_list[1:]:
-                    pv_total = pv_total.add(s, fill_value=0.0)
-                pv_total.name = "PV generation"
-                fig_all.add_scatter(
-                    x=pv_total.index,
-                    y=pv_total.values,
-                    mode="lines",
-                    name="PV generation",
-                    fill="tozeroy",                 # <-- area under the curve
-                    fillcolor="rgba(255, 230, 150, 0.4)",  # soft transparent yellow
-                    line=dict(width=2),
-                )
-
-
-            fig_all.update_layout(
-                height=320,
-                margin=dict(l=10, r=10, t=20, b=30),
-                xaxis_title="Time of day",
-                yaxis_title="kW",
-            )
-            st.plotly_chart(fig_all, use_container_width=True)
-
-            # save load and PV
-            if total_load is not None:
-                st.session_state ["load"]= total_load
-            if pv_total is not None:
-                st.session_state ["pv"]= pv_total
+                
 
 #%% -------------------for page 3------------------------------------
 
+def _norm01(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    lo, hi = float(np.nanmin(s.values)), float(np.nanmax(s.values))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi - lo < 1e-12:
+        # flat if constant/missing
+        return pd.Series(0.5, index=s.index, dtype=float)
+    out = (s - lo) / (hi - lo)
+    return out.reindex(s.index).interpolate().bfill().ffill().astype(float)
 
 
+def _ts_layout(title: str, ytitle: str = "kW", height: int = 280):
+    return dict(
+        title=dict(
+            text=title,
+            x=0.01, xanchor="left",
+            y=0.98, yanchor="top",
+            pad=dict(t=2, b=0, l=0, r=0)   # <- extra space under the title
+        ),
+        hovermode="x unified",
+        height=height,
+        margin=dict(l=36, r=16, t=64, b=32),     # <- larger top margin
+        xaxis=dict(
+            title="Time",
+            type="date",
+            rangeslider=dict(visible=False),
+        ),
+        yaxis=dict(title=ytitle),
+        legend=dict(orientation="h", yanchor="bottom", y=1.06, x=0)
+    )
 
+def ems_power_split_plot(idx, load, pv, grid_import, pbat):
+    """Stack-like view for EMS split."""
+    fig = go.Figure()
+    fig.add_scatter(x=idx, y=load, name="Load (kW)", mode="lines")
+    fig.add_scatter(x=idx, y=pv,   name="PV (kW)",   mode="lines")
+    fig.add_scatter(x=idx, y=grid_import, name="Grid import (kW)", mode="lines")
+    fig.add_scatter(x=idx, y=pbat, name="Battery power (kW, +dis/-ch)", mode="lines")
+    fig.update_layout(_ts_layout("Power split (EMS)", ytitle="kW", height=320))
+    return fig
+
+def ems_soc_plot(idx, soc_kwh, cap_kwh):
+    soc_pct = (soc_kwh / max(cap_kwh, 1e-9)) * 100.0
+    fig = go.Figure()
+    fig.add_scatter(x=idx, y=soc_pct, name="SOC (%)", mode="lines")
+    fig.update_layout(_ts_layout("Battery SOC", ytitle="%", height=220))
+    return fig
 #%% -------- SIDEBAR --------
 st.set_page_config(page_title="Daily EMS Sandbox", layout="wide")
 
 with st.sidebar:
-    st.header("Daily EMS sandbox")
-    st.markdown("### Navigation")
+    st.header("Daily EMS Sandbox")
+    
+    st.header("Navigation")
     page = st.radio(
         "Step",
         ["1️⃣ Scenario & data", "2️⃣ Devices & layout", "3️⃣ Analysis"],
         key="page",
     )
+
+    st.header("House Input")
+    if "house_info" not in st.session_state:
+        st.session_state["house_info"] = {
+            "location": "Aalborg",
+            "size": "Medium house",
+            "insulation": "Average",
+            "residents": 2,
+        }
+
+    hi = st.session_state["house_info"]
+
+    # --- House size ---
+    house_size_options = {
+        "Small apartment": "40–80 m²,  1–3 rooms",
+        "Medium house": "90–150 m²,  3–5 rooms",
+        "Large house": "160–250 m², 5+ rooms",
+    }
+
+    hi["size"] = st.radio(
+        "House size (choose what feels closest)",
+        options=list(house_size_options.keys()),
+        index=["Small apartment", "Medium house", "Large house"].index(hi["size"]),
+    )
+    st.caption(f"**{house_size_options[hi['size']]}**")
+
+    # --- Insulation ---
+    insulation_desc = {
+        "Poor": "Old house (pre-1980), thin walls",
+        "Average": "Typical house (1980–2010), standard",
+        "Good": "New or renovated house, low heat loss",
+    }
+
+    hi["insulation"] = st.radio(
+        "Insulation quality",
+        list(insulation_desc.keys()),
+        horizontal=True,
+        index=["Poor", "Average", "Good"].index(hi["insulation"]),
+    )
+    st.caption(f"**{insulation_desc[hi['insulation']]}**")
+
+    # --- Residents ---
+    hi["residents"] = st.number_input(
+        "How many people live here?",
+        min_value=1, max_value=8, step=1,
+        value=int(hi["residents"]),
+        help="Used to estimate hot-water usage and device patterns.",
+    )
+
+    st.session_state["house_info"] = hi
+
 
 #%% # -------- MAIN AREA --------
 page = st.session_state.get("page", "1️⃣ Scenario & data")
@@ -3161,7 +4399,7 @@ if page.startswith("1️⃣"):
             title="Electricity price over selected period",
             ytitle="DKK/kWh",
         )
-        st.plotly_chart(fig_price, use_container_width=True)
+        st.plotly_chart(fig_price, width='stretch')
         if note_price:
             st.caption(f"ℹ️ {note_price}")
 
@@ -3172,7 +4410,7 @@ if page.startswith("1️⃣"):
             title="CO₂ intensity over selected period",
             ytitle="gCO₂/kWh",
         )
-        st.plotly_chart(fig_co2, use_container_width=True)
+        st.plotly_chart(fig_co2, width='stretch')
         if note_co2:
             st.caption(f"ℹ️ {note_co2}")
 
@@ -3183,7 +4421,7 @@ if page.startswith("1️⃣"):
             title="Outdoor temperature over selected period",
             ytitle="°C",
         )
-        st.plotly_chart(fig_temp, use_container_width=True)
+        st.plotly_chart(fig_temp, width='stretch')
         if note_temp:
             st.caption(f"ℹ️ {note_temp}")
 
@@ -3192,7 +4430,7 @@ if page.startswith("1️⃣"):
 #%% page 2
 elif page.startswith("2️⃣"):
     st.title("2️⃣ Devices & layout")
-    st.info("Here we will later add: baseload, lights, WM/DW/dryer, EV, heat pump, PV, battery, house figure, etc.")
+    st.info("Here we will add different kinds of devices for household")
     
     st.markdown("## 2. Devices & House layout")
     render_devices_page_house()
@@ -3205,8 +4443,260 @@ elif page.startswith("2️⃣"):
 #%% page 3
 elif page.startswith("3️⃣"):
     st.title("3️⃣ Analysis")
-    st.info("Here we will later add: Run simulation, Run EMS, plots, KPIs, and logging.")
-    # --- capacity / power / SOC settings ---
+    st.info("Here we will evaluate daily household consumption plots, KPIs, and logging.")
+
+
+    sel  = st.session_state.get("device_selection", {})
+    cfgs = st.session_state.get("device_configs", {})
+
+    if not sel or not any(sel.values()):
+        st.warning("Please select at least one device on page 2 first.")
+        st.stop()
+
+    # ---------- 1) Build load / PV series ----------
+    idx, load_tot, pv_tot, energy_per_device = build_series_for_analysis(sel, cfgs)
+
+    # Grid import = load minus self-consumed PV (no battery yet)
+    pv_self_kw  = np.minimum(load_tot, pv_tot)
+    grid_import = load_tot - pv_self_kw
+    pv_export   = pv_tot - pv_self_kw
+    pv_export[pv_export < 0] = 0.0
+
+    # kWh integrals (1-min → divide by 60)
+    E_load   = float(load_tot.sum()   / 60.0)
+    E_pv     = float(pv_tot.sum()     / 60.0)
+    E_self   = float(pv_self_kw.sum() / 60.0)
+    E_grid   = float(grid_import.sum() / 60.0)
+    E_export = float(pv_export.sum()   / 60.0)
+
+    pv_cov = (E_self / E_load * 100.0) if E_load > 0 else 0.0
+
+    # ---------- 2) Optional cost / CO₂ ----------
+    price_series = st.session_state.get("price_daily")  # DKK/kWh
+    co2_series   = st.session_state.get("co2_daily")    # g/kWh
+
+    total_cost     = None
+    avg_price      = None
+    cost_no_pv     = None
+    cost_saved_pv  = None
+
+    total_co2_grid_kg  = None
+    co2_no_pv_kg       = None
+    co2_saved_by_pv_kg = None
+
+    # ---- PRICE (DKK/kWh) ----
+    if isinstance(price_series, (pd.Series, pd.DataFrame)):
+        if isinstance(price_series, pd.DataFrame):
+            price_series = price_series.iloc[:, 0]
+        p = price_series.reindex(idx, method="nearest").fillna(0.0)  # DKK/kWh
+
+        # with PV: only grid_import comes from grid
+        total_cost = float((grid_import * p).sum() / 60.0)  # DKK
+        tot_grid_kwh = E_grid if E_grid > 0 else 1e-9
+        avg_price = total_cost / tot_grid_kwh
+
+        # baseline: no PV → all load from grid
+        cost_no_pv = float((load_tot * p).sum() / 60.0)
+        cost_saved_pv = cost_no_pv - total_cost
+
+    # ---- CO2 (g/kWh → kg/kWh) ----
+    if isinstance(co2_series, (pd.Series, pd.DataFrame)):
+        if isinstance(co2_series, pd.DataFrame):
+            co2_series = co2_series.iloc[:, 0]
+        c_g = co2_series.reindex(idx, method="nearest").fillna(0.0)  # g/kWh
+        c_kg = c_g / 1000.0  # kg/kWh
+
+        # with PV: emissions only for grid_import
+        total_co2_grid_kg = float((grid_import * c_kg).sum() / 60.0)
+
+        # baseline: no PV (all load is from grid)
+        co2_no_pv_kg = float((load_tot * c_kg).sum() / 60.0)
+
+        co2_saved_by_pv_kg = co2_no_pv_kg - total_co2_grid_kg
+
+
+
+    # ---------- 3) KPI header ----------
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total consumption", f"{E_load:.1f} kWh")
+    col2.metric("PV generation", f"{E_pv:.1f} kWh")
+    col3.metric("PV coverage", f"{pv_cov:.0f} %")
+
+    col4, col5, col6 = st.columns(3)
+    col4.metric("Grid import", f"{E_grid:.1f} kWh")
+    col5.metric("PV export", f"{E_export:.1f} kWh")
+    if total_cost is not None and avg_price is not None:
+        col6.metric(
+            "Cost (grid)",
+            f"{total_cost:.2f} DKK",
+        )
+    else:
+        col6.metric("Cost (grid)", "n/a")
+
+    # ---- Second row: CO2 KPIs ----
+    if total_co2_grid_kg is not None:
+        c7, c8, c9= st.columns(3)
+        c7.metric("CO₂ from grid", f"{total_co2_grid_kg:.1f} kg")
+        if co2_saved_by_pv_kg is not None:
+            c8.metric("CO₂ avoided by PV", f"{co2_saved_by_pv_kg:.1f} kg")
+
+
+    # ---------- 4) Time-series plot ----------
+    st.markdown("#### Power over the day")
+
+    fig_ts = go.Figure()
+    fig_ts.add_scatter(
+        x=idx, y=load_tot.values,
+        mode="lines",
+        name="Load (kW)",
+    )
+    if pv_tot.max() > 0:
+        # PV plotted below zero with filled area → clear visual separation
+        fig_ts.add_scatter(
+            x=idx,
+            y=-pv_tot.values,
+            mode="lines",
+            name="PV generation (kW)",
+            fill="tozeroy",
+        )
+    fig_ts.add_scatter(
+        x=idx, y=grid_import.values,
+        mode="lines",
+        name="Grid import (kW)",
+    )
+
+    fig_ts.update_layout(
+        height=320,
+        margin=dict(l=10, r=10, t=10, b=70),
+        xaxis_title="Time of day",
+        yaxis_title="kW (PV shown below 0)",
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.3,
+            xanchor="center",
+            x=0.5,
+            itemclick="toggleothers",    # keep your behaviour
+            itemdoubleclick="toggle",
+        ),
+    )
+    st.plotly_chart(fig_ts, use_container_width=True)
+
+    # ---------- 5) Load breakdown (pie by category) ----------
+    st.markdown("#### Consumption breakdown by category")
+
+    cat_energy = {
+        "Fixed electrical": 0.0,
+        "Flexible electrical": 0.0,
+        "Thermal (HP / DHW / leisure)": 0.0,
+        "EV charging": 0.0,
+        "EVs": 0.0,
+    }
+
+    for full_key, E_kwh in energy_per_device.items():
+        cat_key, dev_type = full_key.split(":", 1)
+        if cat_key == "elec_fixed":
+            cat_energy["Fixed electrical"] += E_kwh
+        elif cat_key == "elec_flex":
+            if dev_type in ("ev11", "ebike"):
+                cat_energy["EV charging"] += E_kwh
+            else:
+                cat_energy["Flexible electrical"] += E_kwh
+        elif cat_key == "thermal":
+            cat_energy["Thermal (HP / DHW / leisure)"] += E_kwh
+        elif cat_key == "outside":
+            cat_energy["EVs"] += E_kwh
+        # gen_store (PV) is generation → not part of consumption pie
+
+    labels = []
+    values = []
+    for k, v in cat_energy.items():
+        if v > 0.01:
+            labels.append(k)
+            values.append(v)
+
+    if values:
+        fig_pie = go.Figure(
+            data=[go.Pie(labels=labels, values=values, hole=0.35)]
+        )
+        fig_pie.update_layout(
+            height=300,
+            margin=dict(l=10, r=10, t=10, b=40),
+            legend=dict(
+                orientation="h",
+                yanchor="top",
+                y=-0.2,
+                xanchor="center",
+                x=0.5,
+            ),
+        )
+        st.plotly_chart(fig_pie, use_container_width=True)
+    else:
+        st.caption("No non-zero loads to show in the breakdown.")
+
+    st.markdown("---")
+
+    # ---------- 6) Download data ----------
+    st.markdown("#### Download results")
+
+    df_out = pd.DataFrame(
+        {
+            "P_load_kW": load_tot.values,
+            "P_pv_kW": pv_tot.values,
+            "P_grid_import_kW": grid_import.values,
+            "P_pv_export_kW": pv_export.values,
+        },
+        index=idx,
+    )
+
+    if isinstance(price_series, (pd.Series, pd.DataFrame)):
+        if isinstance(price_series, pd.DataFrame):
+            price_series = price_series.iloc[:, 0]
+        df_out["Price_grid"] = price_series.reindex(idx, method="nearest").values
+
+    if isinstance(co2_series, (pd.Series, pd.DataFrame)):
+        if isinstance(co2_series, pd.DataFrame):
+            co2_series = co2_series.iloc[:, 0]
+        df_out["CO2_intensity"] = co2_series.reindex(idx, method="nearest").values
+
+    kpi_summary = {
+        "E_load_kWh": E_load,
+        "E_pv_kWh": E_pv,
+        "E_self_kWh": E_self,
+        "E_grid_kWh": E_grid,
+        "E_export_kWh": E_export,
+        "PV_coverage_%": pv_cov,
+        "Cost_DKK_with_PV": total_cost,
+        "Cost_DKK_no_PV": cost_no_pv,
+        "Cost_saved_by_PV_DKK": cost_saved_pv,
+        "Avg_price_DKK_per_kWh": avg_price,
+        "CO2_grid_kg": total_co2_grid_kg,
+        "CO2_no_PV_kg": co2_no_pv_kg,
+        "CO2_saved_by_PV_kg": co2_saved_by_pv_kg,
+    }
+
+    kpi_rows = pd.DataFrame([kpi_summary])
+    kpi_rows.index = ["SUMMARY"]
+
+    df_to_save = pd.concat(
+        [
+            kpi_rows,
+            pd.DataFrame(index=[""]),  # blank separator row
+            df_out,
+        ]
+    )
+
+    csv_bytes = df_to_save.to_csv().encode("utf-8")
+    st.download_button(
+        label="📥 Download CSV (profiles + summary)",
+        data=csv_bytes,
+        file_name="house_profile_analysis.csv",
+        mime="text/csv",
+    )
+
+
+
+def future_ems():
     def render_battery_settings_panel():
         """
         Returns control_mode string ("Manual" or "Auto") for convenience.
@@ -3365,7 +4855,7 @@ elif page.startswith("3️⃣"):
         st.session_state["batt_priority"] = cfg["rule_priority"]
 
         return cfg["control_mode"]
- 
+
     if "load" not in st.session_state:
         st.warning("No load profile found. Please configure devices on Page 2 first.")
         st.stop()
@@ -3382,7 +4872,122 @@ elif page.startswith("3️⃣"):
     idx = load_day.index          # your minute index
 
 
+    use_batt = st.checkbox("Use battery in EMS", value=True, key="use_batt_analysis")
+    plan_df = None
+    control_mode = None
+    if use_batt: 
+        # This is your existing panel, now moved here:
+        control_mode = render_battery_settings_panel()
+    else:
+        st.info("Battery is disabled for this analysis. ")
+
+    with st.expander("Multi-objective weights (Cost–CO₂–Comfort)", expanded=True):
+        w_cost= float(
+            st.slider(
+                "Preference (0 = CO₂ only, 1 = cost only)",
+                min_value=0.0,
+                max_value=1.0,
+                step=0.05,
+                value=0.5,
+            )
+        )
+
+    price_min = price_day 
+    co2_min   = co2_day
+    price_n = _norm01(price_min)
+    co2_n   = _norm01(co2_min)
+    signal = (w_cost * co2_n + (1-w_cost) * price_n).rename("device_objective")
+
+    run_ems = st.button("Run EMS",  key="run_ems")
 
 
 
 
+    # --- 1) AUTO mode: button to compute suggested time slots ---
+    if run_ems:
+        if use_batt and control_mode == "Auto":
+            df_minute = (
+                pd.DataFrame({
+                    "DateTime": idx,                      # datetime index created earlier
+                    "Load":     load_day.values,          # kW, minute-cadence
+                    "PV":       pv_day.values,            # kW
+                    "ElectricityPrice": price_day.values, # DKK/kWh
+                    "signal":   signal.values,            # 0..1 signal
+                    "co2":      co2_day.values,           # g/kWh
+                })
+                .sort_values("DateTime")
+            )
+            time_slots = generate_smart_time_slots(df_minute)
+            df_slots   = assign_data_to_time_slots_single(df_minute, time_slots)
+            SOC0 = float(st.session_state["batt_soc_pct"])
+            SOC_min = float(st.session_state.get("soc_min_pct", 15.0))   # <- user input
+            SOC_max = 100.0
+            SOC_opt, Qgrid,_ = mpc_opt_single(
+                df_slots, SOC0=SOC0, SOC_min=SOC_min, SOC_max=SOC_max,
+                Pbat_chargemax=st.session_state["batt_pow"],
+                Qbat=st.session_state["batt_cap"],
+            )
+            df_plan = format_results_single(SOC_opt, Qgrid, df_slots)
+            df_today = df_plan[df_plan["Datetime"] == df_plan["Datetime"].iloc[0]].copy()
+            df_today["start"] = pd.to_datetime(df_today["TimeSlot"].str.split(" - ").str[0], format="%H:%M").dt.time
+            df_today["end"]   = pd.to_datetime(df_today["TimeSlot"].str.split(" - ").str[1], format="%H:%M").dt.time
+            df_today["soc_setpoint_pct"]    = df_today["SOC"]
+            df_today["grid_charge_allowed"] = df_today["Grid_Charge"]
+            plan_df = df_today[["start","end","soc_setpoint_pct","grid_charge_allowed"]]    
+            
+            st.session_state["ems_plan"] = plan_df.copy()
+            ems_out = rule_power_share(
+                idx=price_day.index, load_kw=load_day, pv_kw=pv_day,
+                plan_slots=plan_df,
+                cap_kwh=st.session_state["batt_cap"],
+                p_max_kw=st.session_state["batt_pow"],
+                soc0_kwh=(st.session_state["batt_soc_pct"] / 100.0) * st.session_state["batt_cap"],
+                eta_ch=0.95, eta_dis=0.95,
+                energy_pattern=2,
+            )
+            grid = ems_out["grid_import_kw"]
+            pbat = ems_out["batt_discharge_kw"] - ems_out["batt_charge_kw"]  # +dis, -ch
+            soc  = ems_out["batt_soc_kwh"]
+            
+            # ---- Selected time slots & settings (table) ----
+            plan_df = st.session_state.get("ems_plan")
+            if plan_df is not None and not plan_df.empty:
+                # clean + enrich for display
+                disp = plan_df.copy()
+                # ensure proper dtypes
+                disp["start"] = pd.to_datetime(disp["start"].astype(str)).dt.time
+                disp["end"]   = pd.to_datetime(disp["end"].astype(str)).dt.time
+                # sortable helper for ordering
+                disp["_start_sort"] = pd.to_datetime(disp["start"].astype(str), format="%H:%M:%S")
+                disp = disp.sort_values("_start_sort").drop(columns=["_start_sort"]).reset_index(drop=True)
+                disp.index = np.arange(1, len(disp) + 1)  # Slot numbering
+
+                # Compute duration (min) for each slot on the chosen day
+                day0 = pd.Timestamp(price_day.index[0]).normalize()
+
+                s_ts = pd.to_datetime(disp["start"].astype(str).radd(str(day0.date()) + " "))
+                e_ts = pd.to_datetime(disp["end"].astype(str).radd(str(day0.date()) + " "))
+
+                # handle wrap-around (end earlier than start means it crosses midnight)
+                e_ts = e_ts.mask(e_ts <= s_ts, e_ts + pd.Timedelta(days=1))
+
+                # minutes as integers
+                disp["Duration (min)"] = ((e_ts - s_ts) / pd.Timedelta(minutes=1)).astype(int)
+                # alternatively:
+                # disp["Duration (min)"] = ((e_ts - s_ts).dt.total_seconds() / 60).astype(int)
+
+
+                st.subheader("Selected battery time slots & settings")
+                st.dataframe(
+                    disp.style.format({"SOC target (%)": "{:.0f}", "Duration (min)": "{:d}"}),
+                    width='stretch'
+                )
+
+            st.plotly_chart(ems_power_split_plot(price_day.index, load_day, pv_day, grid, pbat), width='stretch')
+            st.plotly_chart(ems_soc_plot(price_day.index, soc, st.session_state["batt_cap"]), width='stretch')
+    return e_ts
+
+
+
+
+            
