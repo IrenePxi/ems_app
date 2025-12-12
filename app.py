@@ -21,26 +21,28 @@ from scipy.optimize import minimize
 from ems import rule_power_share
 from Optimization_based import generate_smart_time_slots, assign_data_to_time_slots_single, mpc_opt_single, mpc_opt_multi, format_results_single
 #%% front page
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "local_debug")
 
 LOG_PATH = Path("usage_log.csv")
 
-
-def log_user_profile_to_csv(profile: dict):
-    """Append one row to a local CSV file."""
+def log_user_profile_to_csv(profile: dict) -> str:
+    """Append one row to a local CSV file and return the timestamp used."""
+    clicked_ts = datetime.now().isoformat(timespec="seconds")
     is_new = not LOG_PATH.exists()
-    df_row = pd.DataFrame(
-        [{
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "occupation": profile.get("occupation", ""),
-            "location": profile.get("location", ""),
-            "session_id": st.session_state.get("session_id", ""),
-        }]
-    )
+
+    df_row = pd.DataFrame([{
+        "timestamp": clicked_ts,
+        "occupation": profile.get("occupation", ""),
+        "location": profile.get("location", ""),
+        "session_id": st.session_state.get("session_id", ""),
+    }])
+
     if is_new:
         df_row.to_csv(LOG_PATH, index=False, mode="w")
     else:
         df_row.to_csv(LOG_PATH, index=False, mode="a", header=False)
 
+    return clicked_ts
 
 def ensure_user_profile():
     """
@@ -49,7 +51,10 @@ def ensure_user_profile():
     Call this ONCE at the start of the app.
     """
     # cheap session id
-    st.session_state.setdefault("session_id", datetime.now().strftime("%Y%m%d-%H%M%S"))
+    st.session_state.setdefault(
+        "session_id",
+        datetime.now().strftime("%Y%m%d-%H%M%S")
+    )
 
     if st.session_state.get("user_profile_confirmed"):
         return  # already done
@@ -74,7 +79,6 @@ def ensure_user_profile():
         index=None,
         help="We only use this for anonymous statistics about who is using the tool.",
     )
-    
 
     location = st.text_input(
         "Where do you live?",
@@ -94,14 +98,59 @@ def ensure_user_profile():
         st.session_state["user_profile"] = profile
         st.session_state["user_profile_confirmed"] = True
 
-        # log to CSV (local; you can later replace this with DB / Google Sheet, etc.)
-        log_user_profile_to_csv(profile)
+        # log + store click time for later
+        clicked_ts = log_user_profile_to_csv(profile)
+        st.session_state["app_start_timestamp"] = clicked_ts
 
         st.rerun()
 
-    # HARD STOP: do not render rest of the app yet
+    # HARD STOP
     st.stop()
+
 ensure_user_profile()
+# --- Hidden admin trigger ---
+admin_mode = st.sidebar.text_input(
+    "Admin access",
+    type="password",
+    help="Internal use only",
+)
+
+   
+def render_admin_stats():
+    st.title("🔐 Admin – App usage statistics")
+
+    if not LOG_PATH.exists():
+        st.info("No usage data recorded yet.")
+        return
+
+    df = pd.read_csv(LOG_PATH, parse_dates=["timestamp"])
+
+    st.subheader("Raw usage log")
+    st.dataframe(df, use_container_width=True)
+
+    st.subheader("Summary")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total sessions", len(df))
+    c2.metric("Unique sessions", df["session_id"].nunique())
+    c3.metric("Unique locations", df["location"].nunique())
+
+    st.subheader("Usage by occupation")
+    st.bar_chart(df["occupation"].value_counts())
+
+    st.subheader("Usage over time")
+    df["date"] = df["timestamp"].dt.date
+    st.line_chart(df.groupby("date").size())
+
+    st.download_button(
+        "📥 Download usage_log.csv",
+        df.to_csv(index=False).encode("utf-8"),
+        file_name="usage_log.csv",
+        mime="text/csv",
+    )
+
+if admin_mode == ADMIN_PASSWORD:
+    render_admin_stats()
+    st.stop()  # prevent rest of app from rendering
 #%% helper for page 1
 # -------- EnergiDataService endpoints --------
 EDS_PRICE_URL_OLD = "https://api.energidataservice.dk/dataset/Elspotprices"
