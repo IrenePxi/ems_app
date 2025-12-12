@@ -92,12 +92,7 @@ def ensure_user_profile():
     st.title("Daily EMS Sandbox")
     st.subheader("Before we start, tell us a bit about yourself 👇")
 
-    # ---- Admin (front page only) ----
-    with st.expander("Admin (internal)", expanded=False):
-        admin_mode = st.text_input("Admin password", type="password")
-        if admin_mode == ADMIN_PASSWORD:
-            render_admin_stats()
-            st.stop()
+    
 
     occupation = st.radio(
         "Your current role",
@@ -116,6 +111,13 @@ def ensure_user_profile():
 
     ready = bool(occupation) and bool(location.strip())
     clicked = st.button("Start using the app ▶️", disabled=not ready)
+
+    # ---- Admin (front page only) ----
+    with st.expander("Admin (internal)", expanded=False):
+        admin_mode = st.text_input("Admin password", type="password")
+        if admin_mode == ADMIN_PASSWORD:
+            render_admin_stats()
+            st.stop()
 
     if clicked and ready:
         profile = {"occupation": occupation, "location": location.strip()}
