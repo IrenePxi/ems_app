@@ -22,6 +22,7 @@ from ems import rule_power_share
 from Optimization_based import generate_smart_time_slots, assign_data_to_time_slots_single, mpc_opt_single, mpc_opt_multi, format_results_single
 #%% front page
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "local_debug")
+ADMIN_PASSWORD = "FCCOGEN"
 
 LOG_PATH = Path("usage_log.csv")
 
@@ -45,11 +46,50 @@ def log_user_profile_to_csv(profile: dict) -> str:
     return clicked_ts
 
 def ensure_user_profile():
-    """
-    Hard gate: show a small intro form until user has provided
-    occupation + living location.
-    Call this ONCE at the start of the app.
-    """
+    def render_admin_stats():
+        st.title("🔐 Admin – App usage statistics")
+
+        if not LOG_PATH.exists():
+            st.info("No usage data recorded yet.")
+            return
+
+        df = pd.read_csv(LOG_PATH, parse_dates=["timestamp"])
+
+        st.subheader("Raw usage log")
+        st.dataframe(df, use_container_width=True)
+
+        st.subheader("Summary")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total sessions", len(df))
+        c2.metric("Unique sessions", df["session_id"].nunique())
+        c3.metric("Unique locations", df["location"].nunique())
+
+        st.subheader("Usage by occupation")
+        st.bar_chart(df["occupation"].value_counts())
+
+        st.subheader("Usage over time")
+        df["date"] = df["timestamp"].dt.date
+        st.line_chart(df.groupby("date").size())
+
+        st.download_button(
+            "📥 Download usage_log.csv",
+            df.to_csv(index=False).encode("utf-8"),
+            file_name="usage_log.csv",
+            mime="text/csv",
+        )
+
+
+    # --- Hidden admin trigger ---
+    admin_mode = st.sidebar.text_input(
+        "Admin access",
+        type="password",
+        help="Internal use only",
+    )
+
+    if admin_mode == ADMIN_PASSWORD:
+        render_admin_stats()
+        st.stop()  # prevent rest of app from rendering
+
     # cheap session id
     st.session_state.setdefault(
         "session_id",
@@ -108,49 +148,7 @@ def ensure_user_profile():
     st.stop()
 
 ensure_user_profile()
-# --- Hidden admin trigger ---
-admin_mode = st.sidebar.text_input(
-    "Admin access",
-    type="password",
-    help="Internal use only",
-)
 
-   
-def render_admin_stats():
-    st.title("🔐 Admin – App usage statistics")
-
-    if not LOG_PATH.exists():
-        st.info("No usage data recorded yet.")
-        return
-
-    df = pd.read_csv(LOG_PATH, parse_dates=["timestamp"])
-
-    st.subheader("Raw usage log")
-    st.dataframe(df, use_container_width=True)
-
-    st.subheader("Summary")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total sessions", len(df))
-    c2.metric("Unique sessions", df["session_id"].nunique())
-    c3.metric("Unique locations", df["location"].nunique())
-
-    st.subheader("Usage by occupation")
-    st.bar_chart(df["occupation"].value_counts())
-
-    st.subheader("Usage over time")
-    df["date"] = df["timestamp"].dt.date
-    st.line_chart(df.groupby("date").size())
-
-    st.download_button(
-        "📥 Download usage_log.csv",
-        df.to_csv(index=False).encode("utf-8"),
-        file_name="usage_log.csv",
-        mime="text/csv",
-    )
-
-if admin_mode == ADMIN_PASSWORD:
-    render_admin_stats()
-    st.stop()  # prevent rest of app from rendering
 #%% helper for page 1
 # -------- EnergiDataService endpoints --------
 EDS_PRICE_URL_OLD = "https://api.energidataservice.dk/dataset/Elspotprices"
