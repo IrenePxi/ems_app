@@ -22,7 +22,6 @@ from ems import rule_power_share
 from Optimization_based import generate_smart_time_slots, assign_data_to_time_slots_single, mpc_opt_single, mpc_opt_multi, format_results_single
 #%% front page
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "local_debug")
-ADMIN_PASSWORD = "FCCOGEN"
 
 LOG_PATH = Path("usage_log.csv")
 
