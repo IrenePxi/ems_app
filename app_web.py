@@ -17,7 +17,7 @@ from app import (
     daily_temperature_with_note, minute_index, DEVICE_CATEGORIES, DEVICE_LABEL_MAP,
     get_default_config, build_minute_profile, compute_daily_profiles,
     build_house_layout_figure, resolve_display_label,
-    suggest_best_interval_for_day
+    suggest_best_interval_for_day, pv_from_weather_modelchain_from_df
 )
 
 # Import thermal device models
@@ -388,6 +388,90 @@ def get_default_config_web(dev_type: str, category: str, house_info: dict) -> di
         
         return {**base, **cfg}
     
+    # Outside category (EVs and outdoor devices)
+    if category == "outside":
+        defaults = {
+            "ev11": {
+                "power_kw": 11.0,
+                "capacity_kwh": 75.0,
+                "soc_arrive": 20.0,
+                "soc_target": 80.0,
+                "w_cost": 1.0,
+                "start": "01:00",
+                "duration_min": 240,
+                "intervals": [{"start": "01:00", "end": "05:00"}],
+            },
+            "ebike": {
+                "power_kw": 0.5,
+                "capacity_kwh": 1.0,
+                "soc_arrive": 40.0,
+                "soc_target": 100.0,
+                "w_cost": 1.0,
+                "start": "01:00",
+                "duration_min": 180,
+                "intervals": [{"start": "01:00", "end": "04:00"}],
+            },
+        }
+        
+        cfg = defaults.get(dev_type, {}).copy()
+        if not cfg:
+            cfg = {"power_kw": 1.0, "start": "18:00", "duration_min": 60}
+        
+        # Calculate energy needed and duration for EV types
+        if dev_type in ("ev11", "ebike"):
+            delta_soc = max(cfg.get("soc_target", 80) - cfg.get("soc_arrive", 20), 0) / 100.0
+            energy_need = delta_soc * cfg.get("capacity_kwh", 75)
+            if cfg.get("power_kw", 11) > 0 and energy_need > 0:
+                duration_min = int(np.ceil(energy_need * 60.0 / cfg.get("power_kw", 11)))
+            else:
+                duration_min = 0
+            cfg["duration_min"] = duration_min
+            cfg["energy_need_kwh"] = energy_need
+            
+            # Update intervals based on duration
+            start_str = cfg.get("start", "01:00")
+            try:
+                start_parts = start_str.split(":")
+                start_hour = int(start_parts[0])
+                start_min = int(start_parts[1]) if len(start_parts) > 1 else 0
+            except:
+                start_hour, start_min = 1, 0
+            
+            end_total_min = start_hour * 60 + start_min + duration_min
+            end_hour = (end_total_min // 60) % 24
+            end_min = end_total_min % 60
+            cfg["intervals"] = [{"start": start_str, "end": f"{end_hour:02d}:{end_min:02d}"}]
+        
+        return {**base, **cfg}
+    
+    # Generation & Storage category
+    if category == "gen_store":
+        # PV and other generation/storage defaults
+        base_gen = {
+            "power_kw": 0.0,  # generation, not consumption
+            "start": "00:00",
+            "duration_min": 0,
+        }
+        
+        defaults = {
+            "pv": {
+                "module_wp": 400.0,
+                "n_panels": 16,
+                "tilt": 30.0,
+                "azimuth": 180.0,
+                "loss_frac": 0.14,
+                "power_kw": 0.0,
+            },
+            # Other gen_store types (not yet implemented)
+            "battery": {"power_kw": 0.0},
+            "fuel_cell": {"power_kw": 0.0},
+            "diesel_gen": {"power_kw": 0.0},
+            "electrolyzer": {"power_kw": 0.0},
+        }
+        
+        cfg = defaults.get(dev_type, {}).copy()
+        return {**base_gen, **cfg}
+    
     # For other categories, return base for now
     return base
 
@@ -752,6 +836,19 @@ def fetch_weather():
         
         # IMPORTANT: Store temperature data in session for thermal device calculations
         session['temp_daily'] = period_data
+        
+        # IMPORTANT: Store full weather data (GHI, DNI, DHI, temp, wind) for PV calculations
+        if weather_hr is not None and not weather_hr.empty:
+            weather_hr_serializable = {
+                'index': weather_hr.index.strftime('%Y-%m-%d %H:%M:%S').tolist(),
+            }
+            # Store each column that exists
+            for col in ['ghi', 'dni', 'dhi', 'temp', 'wind']:
+                if col in weather_hr.columns:
+                    weather_hr_serializable[col] = weather_hr[col].fillna(0).tolist()
+            session['weather_hr'] = weather_hr_serializable
+            print(f"DEBUG fetch_weather: Stored weather_hr with columns {list(weather_hr_serializable.keys())}, {len(weather_hr_serializable['index'])} rows")
+        
         session.modified = True
         print(f"DEBUG fetch_weather: Stored temp_daily with {len(period_data['values'])} data points")
         
@@ -1464,6 +1561,116 @@ def compute_thermal_profiles():
         session.modified = True
         
         return jsonify({'success': True, 'profiles': profiles})
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/compute-pv-profile', methods=['POST'])
+def compute_pv_profile():
+    """Compute PV power profile based on settings and weather data."""
+    try:
+        data = request.json or {}
+        
+        # Get PV parameters
+        module_wp = float(data.get('module_wp', 400.0))
+        n_panels = int(data.get('n_panels', 16))
+        tilt = float(data.get('tilt', 30.0))
+        azimuth = float(data.get('azimuth', 180.0))
+        loss_frac = float(data.get('loss_frac', 0.14))
+        
+        # Calculate total kWp
+        kwp = (module_wp * n_panels) / 1000.0
+        
+        if kwp <= 0:
+            return jsonify({
+                'success': True, 
+                'profile': {'index': [], 'values': []},
+                'kwp': 0,
+                'note': 'No PV installed (0 panels or 0 Wp)'
+            })
+        
+        # Get location from session
+        geo_lat = float(session.get('geo_lat', 57.0488))
+        geo_lon = float(session.get('geo_lon', 9.9217))
+        
+        # Get the selected day for the profile
+        day_str = session.get('day')
+        if day_str:
+            if isinstance(day_str, str):
+                sel_day = datetime.strptime(day_str, '%Y-%m-%d').date()
+            elif isinstance(day_str, date):
+                sel_day = day_str
+            else:
+                sel_day = date.today()
+        else:
+            sel_day = date.today()
+        
+        # Create minute index for the day
+        day_start = pd.Timestamp(sel_day)
+        day_end = day_start + timedelta(days=1)
+        idx_pv = pd.date_range(day_start, day_end, freq='min', inclusive='left')
+        
+        pv_series = None
+        note = None
+        
+        # Try to use real weather data from session
+        weather_hr = session.get('weather_hr')
+        print(f"DEBUG compute-pv-profile: weather_hr in session = {weather_hr is not None}")
+        if weather_hr is not None and isinstance(weather_hr, dict):
+            # Convert back to DataFrame
+            try:
+                # Build DataFrame from individual columns, not including 'index' as a column
+                data_cols = {col: weather_hr[col] for col in ['ghi', 'dni', 'dhi', 'temp', 'wind'] if col in weather_hr}
+                
+                if data_cols and 'index' in weather_hr:
+                    weather_df = pd.DataFrame(data_cols)
+                    weather_df.index = pd.to_datetime(weather_hr['index'])
+                    print(f"DEBUG compute-pv-profile: Reconstructed weather_df with shape {weather_df.shape}, columns {list(weather_df.columns)}")
+                    
+                    if not weather_df.empty and 'ghi' in weather_df.columns:
+                        pv_series = pv_from_weather_modelchain_from_df(
+                            idx_min=idx_pv,
+                            dfh=weather_df,
+                            lat=geo_lat,
+                            lon=geo_lon,
+                            kwp=kwp,
+                            tilt_deg=tilt,
+                            az_deg=azimuth,
+                            sys_loss_frac=loss_frac,
+                        )
+                        note = "Using fetched weather data for PV preview."
+                        print(f"DEBUG compute-pv-profile: PV series computed successfully, max={pv_series.max():.2f} kW")
+                else:
+                    print(f"DEBUG compute-pv-profile: Missing data columns or index in weather_hr")
+            except Exception as e:
+                import traceback
+                print(f"Error using weather data for PV: {e}")
+                traceback.print_exc()
+                pv_series = None
+        
+        # Fallback to synthetic bell-shaped curve
+        if pv_series is None:
+            hours = idx_pv.hour + idx_pv.minute / 60.0
+            # Bell-shaped curve: sunrise ~6am, sunset ~18pm
+            shape = np.maximum(0.0, np.sin(np.pi * (hours - 6.0) / 12.0))
+            pv_series = pd.Series(kwp * shape, index=idx_pv, name='pv_kw')
+            note = "No weather data – showing a synthetic PV curve."
+        
+        # Calculate daily energy
+        energy_kwh = float(pv_series.sum() / 60.0)  # 1-min resolution
+        
+        return jsonify({
+            'success': True,
+            'profile': {
+                'index': pv_series.index.strftime('%Y-%m-%d %H:%M:%S').tolist(),
+                'values': pv_series.values.tolist()
+            },
+            'kwp': kwp,
+            'energy_kwh': energy_kwh,
+            'note': note
+        })
         
     except Exception as e:
         import traceback

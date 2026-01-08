@@ -1266,6 +1266,209 @@ $(document).ready(function() {
                     </div>
                 `;
             }
+        } else if (category === 'outside') {
+            // EV and outdoor device configuration
+            html = '';
+            
+            if (devType === 'ev11' || devType === 'ebike') {
+                const isEV = devType === 'ev11';
+                const powerKw = config.power_kw || (isEV ? 11.0 : 0.5);
+                const capacityKwh = config.capacity_kwh || (isEV ? 75.0 : 1.0);
+                const socArrive = config.soc_arrive || (isEV ? 20.0 : 40.0);
+                const socTarget = config.soc_target || (isEV ? 80.0 : 100.0);
+                const wCost = config.w_cost !== undefined ? config.w_cost : 1.0;
+                
+                // Calculate energy needed and duration
+                const deltaSoc = Math.max(socTarget - socArrive, 0) / 100.0;
+                const energyNeed = deltaSoc * capacityKwh;
+                const durationMin = powerKw > 0 && energyNeed > 0 ? Math.ceil(energyNeed * 60.0 / powerKw) : 0;
+                
+                // Get interval times
+                let startTimeStr = '01:00';
+                if (config.intervals && config.intervals.length > 0) {
+                    const iv = config.intervals[0];
+                    if (typeof iv.start === 'string') {
+                        startTimeStr = iv.start;
+                    } else if (iv.start && typeof iv.start === 'object') {
+                        startTimeStr = `${String(iv.start.hour || 1).padStart(2, '0')}:${String(iv.start.minute || 0).padStart(2, '0')}`;
+                    }
+                } else if (config.start) {
+                    startTimeStr = typeof config.start === 'string' ? config.start : `${String(config.start.hour || 1).padStart(2, '0')}:${String(config.start.minute || 0).padStart(2, '0')}`;
+                }
+                
+                // Calculate end time from start + duration
+                const [sh, sm] = startTimeStr.split(':').map(Number);
+                const totalMinEnd = sh * 60 + sm + durationMin;
+                const endHour = Math.floor(totalMinEnd / 60) % 24;
+                const endMin = totalMinEnd % 60;
+                const endTimeStr = `${String(endHour).padStart(2, '0')}:${String(endMin).padStart(2, '0')}`;
+                
+                const deviceLabel = isEV ? 'EV' : 'E-bike';
+                const windowLabel = '01:00–06:00';
+                
+                html = `
+                    <div class="alert alert-info mb-3">
+                        <strong>${deviceLabel} charging settings</strong><br>
+                        <small>Default charging window: ${windowLabel}</small>
+                    </div>
+                    
+                    <div class="row g-2 mb-3">
+                        <div class="col-6">
+                            <label class="form-label">Charger power (kW)</label>
+                            <input type="number" class="form-control" id="configEvPowerKw" 
+                                   value="${powerKw}" min="${isEV ? 1 : 0.1}" max="${isEV ? 50 : 5}" step="${isEV ? 0.5 : 0.1}">
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Battery capacity (kWh)</label>
+                            <input type="number" class="form-control" id="configEvCapacityKwh" 
+                                   value="${capacityKwh}" min="${isEV ? 10 : 0.2}" max="${isEV ? 200 : 5}" step="${isEV ? 1 : 0.1}">
+                        </div>
+                    </div>
+                    
+                    <div class="row g-2 mb-3">
+                        <div class="col-6">
+                            <label class="form-label">Arrival SOC (%)</label>
+                            <input type="number" class="form-control" id="configEvSocArrive" 
+                                   value="${socArrive}" min="0" max="100" step="5">
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Target SOC at departure (%)</label>
+                            <input type="number" class="form-control" id="configEvSocTarget" 
+                                   value="${socTarget}" min="0" max="100" step="5">
+                        </div>
+                    </div>
+                    
+                    <div class="alert alert-secondary mb-3 py-2">
+                        <small>
+                            <strong>Energy needed:</strong> <span id="evEnergyNeeded">${energyNeed.toFixed(1)}</span> kWh<br>
+                            <strong>Charging time:</strong> <span id="evChargingTime">${durationMin}</span> min at <span id="evPowerDisplay">${powerKw}</span> kW
+                        </small>
+                    </div>
+                    
+                    <hr>
+                    
+                    <div class="mb-3">
+                        <label class="form-label">Preference (0 = CO₂ only, 1 = cost only)</label>
+                        <input type="range" class="form-range" id="configEvWCost" 
+                               min="0" max="1" step="0.05" value="${wCost}">
+                        <small class="text-muted">Current: <span id="evWCostDisplay">${wCost.toFixed(2)}</span></small>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label class="form-label">Current scheduled interval</label>
+                        <div class="row g-2">
+                            <div class="col-6">
+                                <label class="form-label small">Start</label>
+                                <input type="time" class="form-control" id="configEvStartTime" value="${startTimeStr}">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label small">End (computed)</label>
+                                <input type="time" class="form-control" id="configEvEndTime" value="${endTimeStr}" readonly>
+                            </div>
+                        </div>
+                        <small class="text-muted">End time is auto-calculated from start + charging duration.</small>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <button type="button" class="btn btn-primary w-100" id="suggestEvInterval">
+                            <i class="bi bi-lightbulb me-2"></i>Suggest cheapest/cleanest interval (01:00–06:00)
+                        </button>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label class="form-label">Daily charging profile (preview)</label>
+                        <div id="profilePreview" style="height: 150px;"></div>
+                    </div>
+                `;
+            }
+        } else if (category === 'gen_store') {
+            // Generation & Storage category
+            if (devType === 'pv') {
+                // PV System configuration
+                const moduleWp = config.module_wp || 400;
+                const nPanels = config.n_panels || 16;
+                const tilt = config.tilt || 30;
+                const azimuth = config.azimuth || 180;
+                const lossFrac = config.loss_frac || 0.14;
+                const kwp = (moduleWp * nPanels) / 1000.0;
+                
+                html = `
+                    <div class="alert alert-success mb-3">
+                        <strong>☀️ PV System Settings</strong><br>
+                        <small>Configure your solar panel installation</small>
+                    </div>
+                    
+                    <div class="row g-2 mb-3">
+                        <div class="col-6">
+                            <label class="form-label">Module nameplate (Wp)</label>
+                            <input type="number" class="form-control" id="configPvModuleWp" 
+                                   value="${moduleWp}" min="50" max="1000" step="10">
+                            <small class="text-muted">Power per panel</small>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Number of panels</label>
+                            <input type="number" class="form-control" id="configPvNPanels" 
+                                   value="${nPanels}" min="0" max="200" step="1">
+                        </div>
+                    </div>
+                    
+                    <div class="alert alert-secondary mb-3 py-2">
+                        <strong>Total DC size:</strong> <span id="pvKwpDisplay">${kwp.toFixed(2)}</span> kWp
+                    </div>
+                    
+                    <div class="row g-2 mb-3">
+                        <div class="col-6">
+                            <label class="form-label">Tilt angle (°)</label>
+                            <input type="number" class="form-control" id="configPvTilt" 
+                                   value="${tilt}" min="0" max="90" step="1">
+                            <small class="text-muted">0° = horizontal, 90° = vertical</small>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">Azimuth (°)</label>
+                            <input type="number" class="form-control" id="configPvAzimuth" 
+                                   value="${azimuth}" min="0" max="360" step="1">
+                            <small class="text-muted">180° = South (optimal in DK)</small>
+                        </div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label class="form-label">System losses (%)</label>
+                        <input type="range" class="form-range" id="configPvLossFrac" 
+                               value="${lossFrac * 100}" min="0" max="50" step="1">
+                        <div class="d-flex justify-content-between">
+                            <small class="text-muted">0%</small>
+                            <small><span id="pvLossDisplay">${(lossFrac * 100).toFixed(0)}</span>%</small>
+                            <small class="text-muted">50%</small>
+                        </div>
+                        <small class="text-muted">Includes wiring, inverter, soiling, shading losses</small>
+                    </div>
+                    
+                    <hr>
+                    
+                    <div class="mb-3">
+                        <label class="form-label"><strong>PV power profile (preview)</strong></label>
+                        <div id="pvProfilePreview" style="height: 180px;">
+                            <div class="text-center text-muted py-4">
+                                <span class="spinner-border spinner-border-sm me-2"></span>Computing preview...
+                            </div>
+                        </div>
+                        <div class="mt-2">
+                            <small class="text-muted" id="pvProfileNote"></small>
+                            <br>
+                            <small><strong>Estimated daily energy:</strong> <span id="pvEnergyDisplay">—</span> kWh</small>
+                        </div>
+                    </div>
+                `;
+            } else {
+                // Other gen_store devices (battery, fuel_cell, etc.) - not yet implemented
+                html = `
+                    <div class="alert alert-warning">
+                        <i class="bi bi-exclamation-triangle me-2"></i>
+                        <strong>Coming soon!</strong><br>
+                        This component will be supported in a future version. For now, it does not affect your daily load or generation.
+                    </div>
+                `;
+            }
         }
         
         modalBody.html(html);
@@ -1331,6 +1534,16 @@ $(document).ready(function() {
             // Handle thermal device modal events
             if (category === 'thermal') {
                 setupThermalModalHandlers(devType, config);
+            }
+            
+            // Handle EV/outside device modal events
+            if (category === 'outside' && (devType === 'ev11' || devType === 'ebike')) {
+                setupEvModalHandlers(devType, config);
+            }
+            
+            // Handle PV/gen_store device modal events
+            if (category === 'gen_store' && devType === 'pv') {
+                setupPvModalHandlers(devType, config);
             }
             
             // For flexible devices, ensure end time is calculated and preview is shown
@@ -1591,6 +1804,313 @@ $(document).ready(function() {
             // Initial preview
             updateModalThermalPreview();
         }
+    }
+    
+    // =====================================================
+    // EV/OUTSIDE DEVICE MODAL HANDLERS
+    // =====================================================
+    function setupEvModalHandlers(devType, config) {
+        console.log('Setting up EV modal handlers for:', devType);
+        const isEV = devType === 'ev11';
+        
+        // Function to recalculate energy needed and duration
+        function updateEvCalculations() {
+            const powerKw = parseFloat($('#configEvPowerKw').val()) || (isEV ? 11 : 0.5);
+            const capacityKwh = parseFloat($('#configEvCapacityKwh').val()) || (isEV ? 75 : 1);
+            const socArrive = parseFloat($('#configEvSocArrive').val()) || 0;
+            const socTarget = parseFloat($('#configEvSocTarget').val()) || 100;
+            
+            // Ensure target >= arrive
+            if (socTarget < socArrive) {
+                $('#configEvSocTarget').val(socArrive);
+            }
+            
+            const deltaSoc = Math.max(socTarget - socArrive, 0) / 100.0;
+            const energyNeed = deltaSoc * capacityKwh;
+            const durationMin = powerKw > 0 && energyNeed > 0 ? Math.ceil(energyNeed * 60.0 / powerKw) : 0;
+            
+            // Update display
+            $('#evEnergyNeeded').text(energyNeed.toFixed(1));
+            $('#evChargingTime').text(durationMin);
+            $('#evPowerDisplay').text(powerKw.toFixed(1));
+            
+            // Update end time based on start time + duration
+            const startTimeStr = $('#configEvStartTime').val() || '01:00';
+            const [sh, sm] = startTimeStr.split(':').map(Number);
+            const totalMinEnd = sh * 60 + sm + durationMin;
+            const endHour = Math.floor(totalMinEnd / 60) % 24;
+            const endMin = totalMinEnd % 60;
+            const endTimeStr = `${String(endHour).padStart(2, '0')}:${String(endMin).padStart(2, '0')}`;
+            $('#configEvEndTime').val(endTimeStr);
+            
+            // Update preview
+            updateEvProfilePreview();
+        }
+        
+        // Function to update profile preview
+        function updateEvProfilePreview() {
+            const powerKw = parseFloat($('#configEvPowerKw').val()) || (isEV ? 11 : 0.5);
+            const startTime = $('#configEvStartTime').val() || '01:00';
+            const endTime = $('#configEvEndTime').val() || '05:00';
+            
+            if (typeof Plotly === 'undefined') {
+                console.warn('Plotly not loaded');
+                return;
+            }
+            
+            // Build simple profile
+            const [sh, sm] = startTime.split(':').map(Number);
+            const [eh, em] = endTime.split(':').map(Number);
+            
+            const startMin = sh * 60 + sm;
+            let endMin = eh * 60 + em;
+            if (endMin <= startMin) endMin += 24 * 60; // Handle overnight
+            
+            const times = [];
+            const values = [];
+            const baseDate = '2025-01-10';
+            
+            for (let m = 0; m < 24 * 60; m++) {
+                const h = Math.floor(m / 60);
+                const min = m % 60;
+                times.push(`${baseDate}T${String(h).padStart(2,'0')}:${String(min).padStart(2,'0')}:00`);
+                
+                // Check if this minute is within charging window
+                let inWindow = false;
+                if (startMin < endMin) {
+                    inWindow = m >= startMin && m < endMin;
+                } else {
+                    // Overnight wrap
+                    inWindow = m >= startMin || m < (endMin % (24*60));
+                }
+                values.push(inWindow ? powerKw : 0);
+            }
+            
+            const trace = {
+                x: times,
+                y: values,
+                mode: 'lines',
+                type: 'scatter',
+                line: { color: '#3b82f6', width: 2 },
+                fill: 'tozeroy',
+                fillcolor: 'rgba(59, 130, 246, 0.2)'
+            };
+            
+            const layout = {
+                height: 150,
+                margin: { l: 40, r: 10, t: 10, b: 30 },
+                xaxis: { 
+                    type: 'date',
+                    tickformat: '%H:%M',
+                    title: ''
+                },
+                yaxis: { title: 'kW' },
+                showlegend: false
+            };
+            
+            Plotly.react('profilePreview', [trace], layout, { responsive: true });
+        }
+        
+        // Preference slider display update
+        function updateWCostDisplay() {
+            const wCost = parseFloat($('#configEvWCost').val()) || 0.5;
+            $('#evWCostDisplay').text(wCost.toFixed(2));
+        }
+        
+        // Suggest optimal interval button handler
+        $('#suggestEvInterval').off('click').on('click', function() {
+            const powerKw = parseFloat($('#configEvPowerKw').val()) || (isEV ? 11 : 0.5);
+            const capacityKwh = parseFloat($('#configEvCapacityKwh').val()) || (isEV ? 75 : 1);
+            const socArrive = parseFloat($('#configEvSocArrive').val()) || 0;
+            const socTarget = parseFloat($('#configEvSocTarget').val()) || 100;
+            const wCost = parseFloat($('#configEvWCost').val()) || 1.0;
+            
+            const deltaSoc = Math.max(socTarget - socArrive, 0) / 100.0;
+            const energyNeed = deltaSoc * capacityKwh;
+            const durationMin = powerKw > 0 && energyNeed > 0 ? Math.ceil(energyNeed * 60.0 / powerKw) : 0;
+            
+            if (durationMin <= 0) {
+                showAlert('No energy needed (arrival SOC ≥ target SOC)', 'warning');
+                return;
+            }
+            
+            // Use the existing suggest-interval API with 01:00-06:00 window
+            const btn = $(this);
+            btn.prop('disabled', true).html('<span class="spinner-border spinner-border-sm me-2"></span>Finding optimal slot...');
+            
+            $.ajax({
+                url: '/api/suggest-interval',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({
+                    duration_min: durationMin,
+                    w_cost: wCost,
+                    earliest: '01:00',
+                    latest: '06:00'
+                }),
+                success: function(response) {
+                    btn.prop('disabled', false).html('<i class="bi bi-lightbulb me-2"></i>Suggest cheapest/cleanest interval (01:00–06:00)');
+                    if (response.success && response.interval) {
+                        $('#configEvStartTime').val(response.interval.start);
+                        updateEvCalculations();
+                        showAlert(`Suggested interval: ${response.interval.start}–${response.interval.end}`, 'success');
+                    } else {
+                        showAlert(response.error || 'Could not suggest interval. Fetch price/CO2 data on page 1 first.', 'warning');
+                    }
+                },
+                error: function(xhr) {
+                    btn.prop('disabled', false).html('<i class="bi bi-lightbulb me-2"></i>Suggest cheapest/cleanest interval (01:00–06:00)');
+                    const msg = xhr.responseJSON?.error || 'Failed to suggest interval';
+                    showAlert(msg, 'danger');
+                }
+            });
+        });
+        
+        // Attach event handlers
+        $('#configEvPowerKw, #configEvCapacityKwh, #configEvSocArrive, #configEvSocTarget').off('input change').on('input change', updateEvCalculations);
+        $('#configEvStartTime').off('input change').on('input change', updateEvCalculations);
+        $('#configEvWCost').off('input').on('input', function() {
+            updateWCostDisplay();
+        });
+        
+        // Initial calculations
+        setTimeout(function() {
+            updateEvCalculations();
+            updateWCostDisplay();
+        }, 100);
+    }
+    
+    // =====================================================
+    // PV/GEN_STORE DEVICE MODAL HANDLERS
+    // =====================================================
+    function setupPvModalHandlers(devType, config) {
+        console.log('Setting up PV modal handlers');
+        
+        // Debounce for preview updates
+        let pvPreviewTimeout = null;
+        
+        function updateKwpDisplay() {
+            const moduleWp = parseFloat($('#configPvModuleWp').val()) || 400;
+            const nPanels = parseInt($('#configPvNPanels').val()) || 16;
+            const kwp = (moduleWp * nPanels) / 1000.0;
+            $('#pvKwpDisplay').text(kwp.toFixed(2));
+        }
+        
+        function updateLossDisplay() {
+            const lossPct = parseFloat($('#configPvLossFrac').val()) || 14;
+            $('#pvLossDisplay').text(lossPct.toFixed(0));
+        }
+        
+        function updatePvPreview() {
+            // Clear any pending timeout
+            if (pvPreviewTimeout) {
+                clearTimeout(pvPreviewTimeout);
+            }
+            
+            // Debounce the preview call
+            pvPreviewTimeout = setTimeout(function() {
+                const moduleWp = parseFloat($('#configPvModuleWp').val()) || 400;
+                const nPanels = parseInt($('#configPvNPanels').val()) || 16;
+                const tilt = parseFloat($('#configPvTilt').val()) || 30;
+                const azimuth = parseFloat($('#configPvAzimuth').val()) || 180;
+                const lossFrac = (parseFloat($('#configPvLossFrac').val()) || 14) / 100.0;
+                
+                const kwp = (moduleWp * nPanels) / 1000.0;
+                
+                // Show loading state
+                $('#pvProfilePreview').html('<div class="text-center text-muted py-4"><span class="spinner-border spinner-border-sm me-2"></span>Computing PV profile...</div>');
+                
+                if (kwp <= 0) {
+                    $('#pvProfilePreview').html('<div class="text-center text-muted py-4">No PV installed (0 panels)</div>');
+                    $('#pvEnergyDisplay').text('0');
+                    $('#pvProfileNote').text('');
+                    return;
+                }
+                
+                $.ajax({
+                    url: '/api/compute-pv-profile',
+                    method: 'POST',
+                    contentType: 'application/json',
+                    data: JSON.stringify({
+                        module_wp: moduleWp,
+                        n_panels: nPanels,
+                        tilt: tilt,
+                        azimuth: azimuth,
+                        loss_frac: lossFrac
+                    }),
+                    success: function(response) {
+                        if (response.success && response.profile && response.profile.values && response.profile.values.length > 0) {
+                            // Convert index strings to dates for plotting
+                            const xData = response.profile.index.map(ts => new Date(ts));
+                            const yData = response.profile.values;
+                            
+                            const trace = {
+                                x: xData,
+                                y: yData,
+                                type: 'scatter',
+                                mode: 'lines',
+                                fill: 'tozeroy',
+                                fillcolor: 'rgba(255, 193, 7, 0.3)',
+                                line: { color: '#ffc107', width: 2 },
+                                name: 'PV Power'
+                            };
+                            
+                            const layout = {
+                                margin: { l: 40, r: 10, t: 10, b: 30 },
+                                xaxis: {
+                                    type: 'date',
+                                    tickformat: '%H:%M',
+                                    title: ''
+                                },
+                                yaxis: {
+                                    title: 'kW',
+                                    rangemode: 'tozero'
+                                },
+                                showlegend: false
+                            };
+                            
+                            $('#pvProfilePreview').empty();
+                            Plotly.newPlot('pvProfilePreview', [trace], layout, { responsive: true, displayModeBar: false });
+                            
+                            // Update energy display
+                            $('#pvEnergyDisplay').text(response.energy_kwh ? response.energy_kwh.toFixed(1) : '—');
+                            $('#pvProfileNote').text(response.note || '');
+                        } else {
+                            $('#pvProfilePreview').html('<div class="text-center text-muted py-4">Could not generate PV profile</div>');
+                            $('#pvEnergyDisplay').text('—');
+                            $('#pvProfileNote').text(response.error || '');
+                        }
+                    },
+                    error: function(xhr) {
+                        console.error('PV profile computation error:', xhr);
+                        $('#pvProfilePreview').html('<div class="text-center text-danger py-4">Error computing PV profile</div>');
+                        $('#pvEnergyDisplay').text('—');
+                    }
+                });
+            }, 300); // 300ms debounce
+        }
+        
+        // Attach event handlers
+        $('#configPvModuleWp, #configPvNPanels').off('input change').on('input change', function() {
+            updateKwpDisplay();
+            updatePvPreview();
+        });
+        
+        $('#configPvTilt, #configPvAzimuth').off('input change').on('input change', function() {
+            updatePvPreview();
+        });
+        
+        $('#configPvLossFrac').off('input').on('input', function() {
+            updateLossDisplay();
+            updatePvPreview();
+        });
+        
+        // Initial display updates
+        setTimeout(function() {
+            updateKwpDisplay();
+            updateLossDisplay();
+            updatePvPreview();
+        }, 100);
     }
     
     function addModalHtSessionRow(start = '18:00', end = '20:00') {
@@ -2027,6 +2547,183 @@ $(document).ready(function() {
             return; // Exit early for thermal devices
         }
         
+        // Handle EV/outside devices
+        if (category === 'outside' && (devType === 'ev11' || devType === 'ebike')) {
+            const powerKw = parseFloat($('#configEvPowerKw').val()) || 11;
+            const capacityKwh = parseFloat($('#configEvCapacityKwh').val()) || 75;
+            const socArrive = parseFloat($('#configEvSocArrive').val()) || 20;
+            const socTarget = parseFloat($('#configEvSocTarget').val()) || 80;
+            const wCost = parseFloat($('#configEvWCost').val()) || 1.0;
+            const startTime = $('#configEvStartTime').val() || '01:00';
+            const endTime = $('#configEvEndTime').val() || '05:00';
+            
+            // Calculate energy and duration
+            const deltaSoc = Math.max(socTarget - socArrive, 0) / 100.0;
+            const energyNeed = deltaSoc * capacityKwh;
+            const durationMin = powerKw > 0 && energyNeed > 0 ? Math.ceil(energyNeed * 60.0 / powerKw) : 0;
+            
+            config = {
+                power_kw: powerKw,
+                capacity_kwh: capacityKwh,
+                soc_arrive: socArrive,
+                soc_target: socTarget,
+                w_cost: wCost,
+                duration_min: durationMin,
+                energy_need_kwh: energyNeed,
+                start: startTime,
+                intervals: [{ start: startTime, end: endTime }]
+            };
+            
+            console.log('Saving EV config:', fullKey, config);
+            
+            // Show loading on button
+            const saveBtn = $('#saveDeviceConfig');
+            const originalBtnText = saveBtn.html();
+            saveBtn.prop('disabled', true).html('<span class="spinner-border spinner-border-sm me-2"></span>Saving...');
+            
+            $.ajax({
+                url: '/api/save-device-config',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({full_key: fullKey, config: config}),
+                success: function(response) {
+                    console.log('EV config save response:', response);
+                    saveBtn.prop('disabled', false).html(originalBtnText);
+                    
+                    // Hide the modal
+                    const modalEl = document.getElementById('deviceConfigModal');
+                    const modal = bootstrap.Modal.getInstance(modalEl);
+                    if (modal) {
+                        modal.hide();
+                    }
+                    
+                    showAlert('EV configuration saved!', 'success');
+                    updateVisualizations();
+                },
+                error: function(xhr) {
+                    console.error('Error saving EV config:', xhr);
+                    saveBtn.prop('disabled', false).html(originalBtnText);
+                    showAlert('Failed to save EV configuration: ' + (xhr.responseJSON?.error || 'Unknown error'), 'danger');
+                }
+            });
+            return; // Exit early for EV devices
+        }
+        
+        // Handle PV/gen_store devices
+        if (category === 'gen_store' && devType === 'pv') {
+            const moduleWp = parseFloat($('#configPvModuleWp').val()) || 400;
+            const nPanels = parseInt($('#configPvNPanels').val()) || 16;
+            const tilt = parseFloat($('#configPvTilt').val()) || 30;
+            const azimuth = parseFloat($('#configPvAzimuth').val()) || 180;
+            const lossFrac = (parseFloat($('#configPvLossFrac').val()) || 14) / 100.0;
+            const kwp = (moduleWp * nPanels) / 1000.0;
+            
+            config = {
+                module_wp: moduleWp,
+                n_panels: nPanels,
+                tilt: tilt,
+                azimuth: azimuth,
+                loss_frac: lossFrac,
+                kwp: kwp,
+                power_kw: 0  // PV is generation, not consumption
+            };
+            
+            console.log('Saving PV config:', fullKey, config);
+            
+            // Show loading on button
+            const saveBtn = $('#saveDeviceConfig');
+            const originalBtnText = saveBtn.html();
+            saveBtn.prop('disabled', true).html('<span class="spinner-border spinner-border-sm me-2"></span>Saving...');
+            
+            // First save the config
+            $.ajax({
+                url: '/api/save-device-config',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({full_key: fullKey, config: config}),
+                success: function(response) {
+                    console.log('PV config save response:', response);
+                    
+                    // Now compute and save the PV profile
+                    $.ajax({
+                        url: '/api/compute-pv-profile',
+                        method: 'POST',
+                        contentType: 'application/json',
+                        data: JSON.stringify({
+                            module_wp: moduleWp,
+                            n_panels: nPanels,
+                            tilt: tilt,
+                            azimuth: azimuth,
+                            loss_frac: lossFrac
+                        }),
+                        success: function(pvResponse) {
+                            if (pvResponse.success && pvResponse.profile) {
+                                // Save the profile to config
+                                config.profile_index = pvResponse.profile.index;
+                                config.profile_kw = pvResponse.profile.values;
+                                
+                                // Update config with profile
+                                $.ajax({
+                                    url: '/api/save-device-config',
+                                    method: 'POST',
+                                    contentType: 'application/json',
+                                    data: JSON.stringify({full_key: fullKey, config: config}),
+                                    success: function() {
+                                        saveBtn.prop('disabled', false).html(originalBtnText);
+                                        
+                                        // Hide the modal
+                                        const modalEl = document.getElementById('deviceConfigModal');
+                                        const modal = bootstrap.Modal.getInstance(modalEl);
+                                        if (modal) {
+                                            modal.hide();
+                                        }
+                                        
+                                        showAlert(`PV configuration saved! (${kwp.toFixed(1)} kWp)`, 'success');
+                                        updateVisualizations();
+                                    },
+                                    error: function(xhr) {
+                                        saveBtn.prop('disabled', false).html(originalBtnText);
+                                        showAlert('Saved config but failed to update profile: ' + (xhr.responseJSON?.error || 'Unknown error'), 'warning');
+                                    }
+                                });
+                            } else {
+                                saveBtn.prop('disabled', false).html(originalBtnText);
+                                
+                                // Hide the modal
+                                const modalEl = document.getElementById('deviceConfigModal');
+                                const modal = bootstrap.Modal.getInstance(modalEl);
+                                if (modal) {
+                                    modal.hide();
+                                }
+                                
+                                showAlert('PV configuration saved (no profile computed)', 'success');
+                                updateVisualizations();
+                            }
+                        },
+                        error: function() {
+                            saveBtn.prop('disabled', false).html(originalBtnText);
+                            
+                            // Hide the modal anyway
+                            const modalEl = document.getElementById('deviceConfigModal');
+                            const modal = bootstrap.Modal.getInstance(modalEl);
+                            if (modal) {
+                                modal.hide();
+                            }
+                            
+                            showAlert('PV configuration saved (profile computation failed)', 'warning');
+                            updateVisualizations();
+                        }
+                    });
+                },
+                error: function(xhr) {
+                    console.error('Error saving PV config:', xhr);
+                    saveBtn.prop('disabled', false).html(originalBtnText);
+                    showAlert('Failed to save PV configuration: ' + (xhr.responseJSON?.error || 'Unknown error'), 'danger');
+                }
+            });
+            return; // Exit early for PV devices
+        }
+        
         // Non-thermal device config
         config = {
             num_devices: parseInt($('#configNumDevices').val()),
@@ -2239,11 +2936,13 @@ $(document).ready(function() {
                     const traces = [];
                     const deviceLabels = {{ device_categories | tojson }};
                     
-                    // Add all device traces
+                    // Add all device traces (excluding PV)
+                    let pvProfile = null;
                     for (const [fullKey, profile] of Object.entries(response.profiles)) {
                         const [catKey, devType] = fullKey.split(':');
                         if (catKey === 'gen_store' && devType === 'pv') {
-                            continue; // Skip PV for now (will add separately)
+                            pvProfile = profile; // Save PV for separate handling
+                            continue;
                         }
                         
                         const label = deviceLabels[catKey]?.devices?.find(d => d[0] === devType)?.[1] || fullKey;
@@ -2256,12 +2955,29 @@ $(document).ready(function() {
                         });
                     }
                     
-                    // Add total trace
+                    // Add PV as a filled area (generation)
+                    if (pvProfile && pvProfile.values && pvProfile.values.length > 0) {
+                        const maxPv = Math.max(...pvProfile.values);
+                        if (maxPv > 0) {
+                            traces.push({
+                                x: pvProfile.index,
+                                y: pvProfile.values,
+                                mode: 'lines',
+                                name: '☀️ PV generation',
+                                type: 'scatter',
+                                fill: 'tozeroy',
+                                fillcolor: 'rgba(255, 193, 7, 0.3)',
+                                line: { color: '#ffc107', width: 1 }
+                            });
+                        }
+                    }
+                    
+                    // Add total load trace
                     traces.push({
                         x: response.total.index,
                         y: response.total.values,
                         mode: 'lines',
-                        name: 'Total',
+                        name: 'Total load',
                         line: {color: 'black', width: 2},
                         type: 'scatter'
                     });
