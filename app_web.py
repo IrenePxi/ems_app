@@ -342,7 +342,7 @@ def get_default_config_web(dev_type: str, category: str, house_info: dict) -> di
         
         defaults = {
             "space_heat": {
-                "space_mode": "None (external supply)",
+                "space_mode": "Electric panels",
                 "t_min_c": 20.0,
                 "t_max_c": 22.0,
                 "q_kw": q_guess,  # House-size based
@@ -352,7 +352,7 @@ def get_default_config_web(dev_type: str, category: str, house_info: dict) -> di
                 "C_th_kwh_per_c": cth_base,
             },
             "dhw": {
-                "dhw_mode": "None (external supply)",
+                "dhw_mode": "Electric DHW tank",
                 "volume_l": vol_default,  # House-size based
                 "usage_level": usage_default,  # Resident-count based
                 "t_min_c": 45.0,
@@ -1219,7 +1219,7 @@ def compute_thermal_profiles():
         
         # ========== SPACE HEATING ==========
         space_cfg = cfgs.get('thermal:space_heat', {})
-        space_mode = space_cfg.get('space_mode', 'None (external supply)')
+        space_mode = space_cfg.get('space_mode', 'Electric panels')
         
         if space_mode != 'None (external supply)':
             t_min = float(space_cfg.get('t_min_c', 20))
@@ -1305,7 +1305,7 @@ def compute_thermal_profiles():
         
         # ========== DHW ==========
         dhw_cfg = cfgs.get('thermal:dhw', {})
-        dhw_mode = dhw_cfg.get('dhw_mode', 'None (external supply)')
+        dhw_mode = dhw_cfg.get('dhw_mode', 'Electric DHW tank')
         
         print(f"DEBUG DHW: dhw_mode = '{dhw_mode}'")
         print(f"DEBUG DHW: full dhw_cfg = {dhw_cfg}")

@@ -1062,7 +1062,7 @@ $(document).ready(function() {
             html = '';
             
             if (devType === 'space_heat') {
-                const spaceMode = config.space_mode || 'None (external supply)';
+                const spaceMode = config.space_mode || 'Electric panels';
                 const tMinC = config.t_min_c || 20;
                 const tMaxC = config.t_max_c || 22;
                 const qKw = config.q_kw || 6;
@@ -1073,15 +1073,13 @@ $(document).ready(function() {
                     <div class="mb-3">
                         <label class="form-label fw-bold">Heating system</label>
                         <select class="form-select" id="modalSpaceMode">
-                            <option value="None (external supply)" ${spaceMode === 'None (external supply)' ? 'selected' : ''}>None (external supply)</option>
                             <option value="Electric panels" ${spaceMode === 'Electric panels' ? 'selected' : ''}>Electric panels</option>
                             <option value="Heat pump – air-to-air" ${spaceMode === 'Heat pump – air-to-air' ? 'selected' : ''}>Heat pump – air-to-air</option>
                             <option value="Heat pump – air-to-water" ${spaceMode === 'Heat pump – air-to-water' ? 'selected' : ''}>Heat pump – air-to-water</option>
                         </select>
-                        <small class="text-muted" id="modalSpaceModeHelp">District heating, gas, or external boiler</small>
                     </div>
                     
-                    <div id="modalSpaceSettings" style="display: ${spaceMode !== 'None (external supply)' ? 'block' : 'none'};">
+                    <div id="modalSpaceSettings">
                         <div class="row g-2 mb-3">
                             <div class="col-6">
                                 <label class="form-label">Min temp (°C)</label>
@@ -1128,7 +1126,7 @@ $(document).ready(function() {
                     </div>
                 `;
             } else if (devType === 'dhw') {
-                const dhwMode = config.dhw_mode || 'None (external supply)';
+                const dhwMode = config.dhw_mode || 'Electric DHW tank';
                 const volumeL = config.volume_l || 200;
                 const usageLevel = config.usage_level || 'Medium';
                 const tMinC = config.t_min_c || 45;
@@ -1139,14 +1137,12 @@ $(document).ready(function() {
                     <div class="mb-3">
                         <label class="form-label fw-bold">DHW system</label>
                         <select class="form-select" id="modalDhwMode">
-                            <option value="None (external supply)" ${dhwMode === 'None (external supply)' ? 'selected' : ''}>None (external supply)</option>
                             <option value="Electric DHW tank" ${dhwMode === 'Electric DHW tank' ? 'selected' : ''}>Electric DHW tank</option>
                             <option value="Heat pump DHW tank" ${dhwMode === 'Heat pump DHW tank' ? 'selected' : ''}>Heat pump DHW tank</option>
                         </select>
-                        <small class="text-muted" id="modalDhwModeHelp">District heating or shared system</small>
                     </div>
                     
-                    <div id="modalDhwSettings" style="display: ${dhwMode !== 'None (external supply)' ? 'block' : 'none'};">
+                    <div id="modalDhwSettings">
                         <div class="row g-2 mb-3">
                             <div class="col-6">
                                 <label class="form-label">Tank volume (L)</label>
@@ -1503,41 +1499,31 @@ $(document).ready(function() {
         if (devType === 'space_heat') {
             // Trigger initial visibility based on current mode
             const spaceMode = $('#modalSpaceMode').val();
-            if (spaceMode !== 'None (external supply)') {
-                $('#modalSpaceSettings').show();
-                if (spaceMode === 'Electric panels') {
-                    $('#modalHpTypeSettings').hide();
-                    $('#modalDistributionSettings').hide();
-                } else if (spaceMode === 'Heat pump – air-to-air') {
-                    $('#modalHpTypeSettings').show();
-                    $('#modalDistributionSettings').hide();
-                } else if (spaceMode === 'Heat pump – air-to-water') {
-                    $('#modalHpTypeSettings').show();
-                    $('#modalDistributionSettings').show();
-                }
+            $('#modalSpaceSettings').show();
+            if (spaceMode === 'Electric panels') {
+                $('#modalHpTypeSettings').hide();
+                $('#modalDistributionSettings').hide();
+            } else if (spaceMode === 'Heat pump – air-to-air') {
+                $('#modalHpTypeSettings').show();
+                $('#modalDistributionSettings').hide();
+            } else if (spaceMode === 'Heat pump – air-to-water') {
+                $('#modalHpTypeSettings').show();
+                $('#modalDistributionSettings').show();
             }
             
             // Listen to mode changes
             $('#modalSpaceMode').off('change').on('change', function() {
                 const mode = $(this).val();
-                if (mode === 'None (external supply)') {
-                    $('#modalSpaceSettings').hide();
-                    $('#modalSpaceModeHelp').text('District heating, gas, or external boiler');
-                } else {
-                    $('#modalSpaceSettings').show();
-                    if (mode === 'Electric panels') {
-                        $('#modalSpaceModeHelp').text('Direct electric resistance heating');
-                        $('#modalHpTypeSettings').hide();
-                        $('#modalDistributionSettings').hide();
-                    } else if (mode === 'Heat pump – air-to-air') {
-                        $('#modalSpaceModeHelp').text('Air-to-air heat pump (no water distribution)');
-                        $('#modalHpTypeSettings').show();
-                        $('#modalDistributionSettings').hide();
-                    } else if (mode === 'Heat pump – air-to-water') {
-                        $('#modalSpaceModeHelp').text('Air-to-water heat pump with hydronic distribution');
-                        $('#modalHpTypeSettings').show();
-                        $('#modalDistributionSettings').show();
-                    }
+                $('#modalSpaceSettings').show();
+                if (mode === 'Electric panels') {
+                    $('#modalHpTypeSettings').hide();
+                    $('#modalDistributionSettings').hide();
+                } else if (mode === 'Heat pump – air-to-air') {
+                    $('#modalHpTypeSettings').show();
+                    $('#modalDistributionSettings').hide();
+                } else if (mode === 'Heat pump – air-to-water') {
+                    $('#modalHpTypeSettings').show();
+                    $('#modalDistributionSettings').show();
                 }
                 updateModalThermalPreview();
             });
@@ -1553,26 +1539,11 @@ $(document).ready(function() {
         // DHW modal handlers
         else if (devType === 'dhw') {
             $('#modalDhwMode').off('change').on('change', function() {
-                const mode = $(this).val();
-                if (mode === 'None (external supply)') {
-                    $('#modalDhwSettings').hide();
-                    $('#modalDhwModeHelp').text('District heating or shared system');
-                } else {
-                    $('#modalDhwSettings').show();
-                    if (mode === 'Electric DHW tank') {
-                        $('#modalDhwModeHelp').text('Electric resistance water heater (COP = 1)');
-                    } else {
-                        $('#modalDhwModeHelp').text('Heat pump water heater (COP ≈ 2.5)');
-                    }
-                }
                 updateModalThermalPreview();
             });
             
-            // Trigger initial visibility based on current mode
-            const dhwMode = $('#modalDhwMode').val();
-            if (dhwMode !== 'None (external supply)') {
-                $('#modalDhwSettings').show();
-            }
+            // Always show DHW settings
+            $('#modalDhwSettings').show();
             
             // Listen to other field changes for preview update
             $('#modalDhwVolume, #modalDhwUsage, #modalDhwTempMin, #modalDhwTempMax, #modalDhwHeaterKw').off('change').on('change', updateModalThermalPreview);
@@ -2335,9 +2306,9 @@ $(document).ready(function() {
     
     function hasThermalLoad(devType, config) {
         if (devType === 'space_heat') {
-            return config.space_mode !== 'None (external supply)';
+            return true; // Always has electric load (no None option)
         } else if (devType === 'dhw') {
-            return config.dhw_mode !== 'None (external supply)';
+            return true; // Always has electric load (no None option)
         } else if (devType === 'leisure') {
             return config.hot_tub_enabled || config.pool_enabled;
         }
@@ -2375,19 +2346,11 @@ $(document).ready(function() {
                 const cfg = configResponse.config || {};
                 
                 if (devType === 'space_heat') {
-                    const mode = cfg.space_mode || 'None (external supply)';
-                    if (mode === 'None (external supply)') {
-                        summaryText = '<span class="text-muted">External supply (no electric load)</span>';
-                    } else {
-                        summaryText = `<strong>${mode}</strong><br><small class="text-muted">${cfg.t_min_c || 20}–${cfg.t_max_c || 22}°C, ${cfg.q_kw || 6} kW</small>`;
-                    }
+                    const mode = cfg.space_mode || 'Electric panels';
+                    summaryText = `<strong>${mode}</strong><br><small class="text-muted">${cfg.t_min_c || 20}–${cfg.t_max_c || 22}°C, ${cfg.q_kw || 6} kW</small>`;
                 } else if (devType === 'dhw') {
-                    const mode = cfg.dhw_mode || 'None (external supply)';
-                    if (mode === 'None (external supply)') {
-                        summaryText = '<span class="text-muted">External supply (no electric load)</span>';
-                    } else {
-                        summaryText = `<strong>${mode}</strong><br><small class="text-muted">${cfg.volume_l || 200}L, ${cfg.usage_level || 'Medium'} usage</small>`;
-                    }
+                    const mode = cfg.dhw_mode || 'Electric DHW tank';
+                    summaryText = `<strong>${mode}</strong><br><small class="text-muted">${cfg.volume_l || 200}L, ${cfg.usage_level || 'Medium'} usage</small>`;
                 } else if (devType === 'leisure') {
                     const htEnabled = cfg.hot_tub_enabled || false;
                     const poolEnabled = cfg.pool_enabled || false;
@@ -2582,21 +2545,11 @@ $(document).ready(function() {
                 const cfg = configResponse.config || {};
                 
                 if (devType === 'space_heat') {
-                    const mode = cfg.space_mode || 'None (external supply)';
-                    if (mode === 'None (external supply)') {
-                        summaryText = '<span class="text-muted">External supply (no electric load)</span>';
-                        $(`#${chartId}`).html('<div class="text-center text-muted small py-2">—</div>');
-                    } else {
-                        summaryText = `<strong>${mode}</strong><br><small class="text-muted">${cfg.t_min_c || 20}–${cfg.t_max_c || 22}°C, ${cfg.q_kw || 6} kW</small>`;
-                    }
+                    const mode = cfg.space_mode || 'Electric panels';
+                    summaryText = `<strong>${mode}</strong><br><small class="text-muted">${cfg.t_min_c || 20}–${cfg.t_max_c || 22}°C, ${cfg.q_kw || 6} kW</small>`;
                 } else if (devType === 'dhw') {
-                    const mode = cfg.dhw_mode || 'None (external supply)';
-                    if (mode === 'None (external supply)') {
-                        summaryText = '<span class="text-muted">External supply (no electric load)</span>';
-                        $(`#${chartId}`).html('<div class="text-center text-muted small py-2">—</div>');
-                    } else {
-                        summaryText = `<strong>${mode}</strong><br><small class="text-muted">${cfg.volume_l || 200}L, ${cfg.usage_level || 'Medium'} usage</small>`;
-                    }
+                    const mode = cfg.dhw_mode || 'Electric DHW tank';
+                    summaryText = `<strong>${mode}</strong><br><small class="text-muted">${cfg.volume_l || 200}L, ${cfg.usage_level || 'Medium'} usage</small>`;
                 } else if (devType === 'leisure') {
                     const htEnabled = cfg.hot_tub_enabled || false;
                     const poolEnabled = cfg.pool_enabled || false;
