@@ -1,0 +1,2673 @@
+{% extends "base.html" %}
+
+{% block title %}Devices & Layout - Daily EMS Sandbox{% endblock %}
+
+{% block content %}
+<div class="container">
+    <h1 class="mb-4">2️⃣ Devices & Layout</h1>
+    
+    <!-- House Information Panel -->
+    <div class="card mb-4 shadow-sm">
+        <div class="card-header bg-primary text-white">
+            <h5 class="mb-0"><i class="bi bi-house me-2"></i>House Information</h5>
+        </div>
+        <div class="card-body">
+            <div class="row">
+                <div class="col-md-4">
+                    <label for="houseSize" class="form-label">House size</label>
+                    <select class="form-select" id="houseSize">
+                        <option value="Small apartment" {% if house_info.size == 'Small apartment' %}selected{% endif %}>Small apartment</option>
+                        <option value="Medium house" {% if house_info.size == 'Medium house' %}selected{% endif %}>Medium house</option>
+                        <option value="Large house" {% if house_info.size == 'Large house' %}selected{% endif %}>Large house</option>
+                    </select>
+                    <small class="form-text text-muted" id="houseSizeDesc">90–150 m², 3–5 rooms</small>
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">Insulation quality</label>
+                    <div class="btn-group w-100" role="group">
+                        <input type="radio" class="btn-check" name="insulation" id="insulationPoor" value="Poor" {% if house_info.insulation == 'Poor' %}checked{% endif %}>
+                        <label class="btn btn-outline-primary" for="insulationPoor">Poor</label>
+                        <input type="radio" class="btn-check" name="insulation" id="insulationAverage" value="Average" {% if house_info.insulation == 'Average' %}checked{% endif %}>
+                        <label class="btn btn-outline-primary" for="insulationAverage">Average</label>
+                        <input type="radio" class="btn-check" name="insulation" id="insulationGood" value="Good" {% if house_info.insulation == 'Good' %}checked{% endif %}>
+                        <label class="btn btn-outline-primary" for="insulationGood">Good</label>
+                    </div>
+                    <small class="form-text text-muted" id="insulationDesc">Typical house (1980–2010), standard</small>
+                </div>
+                <div class="col-md-4">
+                    <label for="residents" class="form-label">Number of residents</label>
+                    <input type="number" class="form-control" id="residents" min="1" max="8" value="{{ house_info.residents }}">
+                    <small class="form-text text-muted">Used to estimate hot-water usage and device patterns.</small>
+                </div>
+            </div>
+            <div class="mt-3">
+                <button class="btn btn-primary" id="saveHouseInfo">
+                    <i class="bi bi-save me-2"></i>Save House Info
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Top Section: Layout and Profiles -->
+    <div class="row mb-3">
+        <div class="col-md-6">
+            <div class="card shadow-sm">
+                <div class="card-header bg-light">
+                    <h5 class="mb-0"><i class="bi bi-diagram-3 me-2"></i>House Layout</h5>
+                </div>
+                <div class="card-body">
+                    <div id="houseLayoutChart" style="height: 400px;"></div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-6">
+            <div class="card shadow-sm">
+                <div class="card-header bg-light">
+                    <h5 class="mb-0"><i class="bi bi-graph-up me-2"></i>Daily Power Profiles</h5>
+                </div>
+                <div class="card-body">
+                    <div id="dailyProfilesChart" style="height: 400px;"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Device Selection Section -->
+    <div class="card shadow-sm">
+        <div class="card-header bg-primary text-white">
+            <h5 class="mb-0"><i class="bi bi-grid me-2"></i>Select the devices in your house</h5>
+        </div>
+        <div class="card-body">
+            <!-- Device Categories -->
+            {% for cat_key, cat_info in device_categories.items() %}
+            <div class="category-section mb-5">
+                <div class="d-flex align-items-center mb-3">
+                    <h5 class="mb-0 me-2">{{ cat_info.title }}</h5>
+                    <span class="badge bg-primary rounded-pill">{{ cat_info.devices|length }} devices</span>
+                </div>
+                <p class="text-muted small mb-3">{{ cat_info.help }}</p>
+                
+                <div class="row g-2 mb-3">
+                    {% for dev_type, label in cat_info.devices %}
+                    {% set full_key = cat_key ~ ':' ~ dev_type %}
+                    {% set is_selected = device_selection.get(full_key, False) %}
+                    <div class="col-md-4 col-sm-6">
+                        <div class="card device-card h-100 {% if is_selected %}border-primary shadow-sm{% else %}border-light{% endif %}" id="deviceCard_{{ full_key|replace(':', '_') }}">
+                            <div class="card-body p-3">
+                                <div class="form-check d-flex align-items-center">
+                                    <input class="form-check-input device-checkbox" type="checkbox" 
+                                           id="device_{{ full_key|replace(':', '_') }}" 
+                                           data-full-key="{{ full_key }}"
+                                           data-dev-type="{{ dev_type }}"
+                                           data-category="{{ cat_key }}"
+                                           {% if is_selected %}checked{% endif %}>
+                                    <label class="form-check-label flex-grow-1 ms-2 mb-0" for="device_{{ full_key|replace(':', '_') }}">
+                                        {{ label }}
+                                    </label>
+                                    <button class="btn btn-sm btn-outline-secondary device-config-btn" 
+                                            data-full-key="{{ full_key }}"
+                                            data-dev-type="{{ dev_type }}"
+                                            data-category="{{ cat_key }}"
+                                            {% if not is_selected %}disabled{% endif %}>
+                                        <i class="bi bi-gear"></i>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+                
+                <!-- Flexible Load Global Settings - Show after flexible devices -->
+                {% if cat_key == 'elec_flex' %}
+                <div class="row g-3 mt-2">
+                    <div class="col-lg-6">
+                        <div class="card border-info shadow-sm h-100">
+                            <div class="card-header bg-info text-white py-2">
+                                <h6 class="mb-0"><i class="bi bi-gear me-2"></i>Global Settings</h6>
+                            </div>
+                            <div class="card-body">
+                                <div class="mb-3">
+                                    <label class="form-label small fw-bold">When is it OK to run flexible devices?</label>
+                                    <select class="form-select form-select-sm" id="flexWindowMode">
+                                        <option value="Any time (00–24)">Any time (00–24)</option>
+                                        <option value="Daytime (08–17)" selected>Daytime (08–17)</option>
+                                        <option value="Evening (17–23)">Evening (17–23)</option>
+                                        <option value="Night (00–06)">Night (00–06)</option>
+                                        <option value="Custom">Custom</option>
+                                    </select>
+                                </div>
+                                <div id="customWindow" style="display: none;">
+                                    <div class="row g-2">
+                                        <div class="col-6">
+                                            <label class="form-label small">Earliest start</label>
+                                            <input type="time" class="form-control form-control-sm" id="flexEarliest" value="07:00">
+                                        </div>
+                                        <div class="col-6">
+                                            <label class="form-label small">Latest finish</label>
+                                            <input type="time" class="form-control form-control-sm" id="flexLatest" value="22:00">
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label small fw-bold">Preference (0 = CO₂ only, 1 = cost only)</label>
+                                    <input type="range" class="form-range" id="flexWCost" min="0" max="1" step="0.05" value="1">
+                                    <div class="d-flex justify-content-between">
+                                        <small class="text-muted">CO₂ only</small>
+                                        <small class="fw-bold" id="flexWCostValue">1.00</small>
+                                        <small class="text-muted">Cost only</small>
+                                    </div>
+                                </div>
+                                <div class="d-grid gap-2">
+                                    <button class="btn btn-primary btn-sm" id="suggestAllSchedules">
+                                        <i class="bi bi-lightbulb me-2"></i>Suggest schedules for all
+                                    </button>
+                                    <button class="btn btn-outline-secondary btn-sm" id="resetAllFlexibleDevices">
+                                        <i class="bi bi-arrow-counterclockwise me-2"></i>Reset to defaults
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Selected Flexible Devices Schedule List -->
+                    <div class="col-lg-6">
+                        <div class="card border-secondary shadow-sm h-100">
+                            <div class="card-header bg-secondary text-white py-2">
+                                <h6 class="mb-0"><i class="bi bi-list-check me-2"></i>Selected Devices & Schedules</h6>
+                            </div>
+                            <div class="card-body p-2">
+                                <div id="flexibleDevicesScheduleList">
+                                    <p class="text-muted mb-0 small"><em>No flexible devices selected yet.</em></p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                {% endif %}
+                
+                <!-- Thermal Devices Summary Panel -->
+                {% if cat_key == 'thermal' %}
+                <div class="row mt-3">
+                    <div class="col-12">
+                        <div class="card border-secondary">
+                            <div class="card-header bg-secondary text-white py-2">
+                                <h6 class="mb-0"><i class="bi bi-thermometer-half me-2"></i>Thermal Devices Summary</h6>
+                            </div>
+                            <div class="card-body">
+                                <div class="row g-3">
+                                    <!-- Space Heating Summary -->
+                                    <div class="col-lg-4">
+                                        <div class="border rounded p-2 h-100 bg-danger bg-opacity-10">
+                                            <div class="d-flex align-items-center mb-2">
+                                                <i class="bi bi-thermometer-sun text-danger me-2 fs-5"></i>
+                                                <strong>Space Heating</strong>
+                                            </div>
+                                            <p class="mb-1 small" id="spaceHeatingSummary">
+                                                <em class="text-muted">Click ⚙️ to configure</em>
+                                            </p>
+                                            <div id="spaceHeatingMiniChart" style="height: 80px;"></div>
+                                        </div>
+                                    </div>
+                                    
+                                    <!-- DHW Summary -->
+                                    <div class="col-lg-4">
+                                        <div class="border rounded p-2 h-100 bg-info bg-opacity-10">
+                                            <div class="d-flex align-items-center mb-2">
+                                                <i class="bi bi-droplet text-info me-2 fs-5"></i>
+                                                <strong>Hot Water (DHW)</strong>
+                                            </div>
+                                            <p class="mb-1 small" id="dhwSummary">
+                                                <em class="text-muted">Click ⚙️ to configure</em>
+                                            </p>
+                                            <div id="dhwMiniChart" style="height: 80px;"></div>
+                                        </div>
+                                    </div>
+                                    
+                                    <!-- Leisure Summary -->
+                                    <div class="col-lg-4">
+                                        <div class="border rounded p-2 h-100 bg-success bg-opacity-10">
+                                            <div class="d-flex align-items-center mb-2">
+                                                <i class="bi bi-water text-success me-2 fs-5"></i>
+                                                <strong>Leisure (Hot Tub/Pool)</strong>
+                                            </div>
+                                            <p class="mb-1 small" id="leisureSummary">
+                                                <em class="text-muted">Click ⚙️ to configure</em>
+                                            </p>
+                                            <div id="leisureMiniChart" style="height: 80px;"></div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <div class="alert alert-info mt-3 mb-0 py-2">
+                                    <small><i class="bi bi-info-circle me-2"></i>Click the ⚙️ icon next to each thermal device to configure settings. Charts update automatically when you save.</small>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+
+<!-- Device Configuration Modal -->
+<div class="modal fade" id="deviceConfigModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="deviceConfigModalTitle">Device Configuration</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="deviceConfigModalBody">
+                <!-- Content will be dynamically generated -->
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-primary" id="saveDeviceConfig">Save Configuration</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+$(document).ready(function() {
+    // House info descriptions
+    const houseSizeDesc = {
+        'Small apartment': '40–80 m², 1–3 rooms',
+        'Medium house': '90–150 m², 3–5 rooms',
+        'Large house': '160–250 m², 5+ rooms'
+    };
+    
+    const insulationDesc = {
+        'Poor': 'Old house (pre-1980), thin walls',
+        'Average': 'Typical house (1980–2010), standard',
+        'Good': 'New or renovated house, low heat loss'
+    };
+    
+    $('#houseSize').on('change', function() {
+        $('#houseSizeDesc').text(houseSizeDesc[$(this).val()]);
+    });
+    
+    $('input[name="insulation"]').on('change', function() {
+        $('#insulationDesc').text(insulationDesc[$(this).val()]);
+    });
+    
+    $('#houseSizeDesc').text(houseSizeDesc[$('#houseSize').val()]);
+    $('#insulationDesc').text(insulationDesc[$('input[name="insulation"]:checked').val()]);
+    
+    // Save house info
+    $('#saveHouseInfo').on('click', function() {
+        const houseInfo = {
+            size: $('#houseSize').val(),
+            insulation: $('input[name="insulation"]:checked').val(),
+            residents: parseInt($('#residents').val())
+        };
+        
+        $.ajax({
+            url: '/api/save-house-info',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify(houseInfo),
+            success: function(response) {
+                if (response.success) {
+                    showAlert('House information saved successfully!', 'success');
+                    updateVisualizations();
+                }
+            },
+            error: function(xhr) {
+                const error = xhr.responseJSON?.error || 'An error occurred';
+                showAlert(error, 'danger');
+            }
+        });
+    });
+    
+    // Flexible load settings
+    $('#flexWindowMode').on('change', function() {
+        if ($(this).val() === 'Custom') {
+            $('#customWindow').show();
+        } else {
+            $('#customWindow').hide();
+        }
+    });
+    
+    $('#flexWCost').on('input', function() {
+        $('#flexWCostValue').text(parseFloat($(this).val()).toFixed(2));
+    });
+    $('#flexWCostValue').text(parseFloat($('#flexWCost').val()).toFixed(2));
+    
+    // Reset all flexible devices to defaults
+    $('#resetAllFlexibleDevices').on('click', function() {
+        const btn = $(this);
+        const originalText = btn.html();
+        
+        // Confirm action
+        if (!confirm('Are you sure you want to reset all selected flexible devices to their default settings? This will overwrite any custom schedules.')) {
+            return;
+        }
+        
+        btn.prop('disabled', true).html('<span class="spinner-border spinner-border-sm me-2"></span>Resetting...');
+        
+        // Get all selected flexible devices
+        const selectedFlexDevices = [];
+        $('.device-checkbox:checked').each(function() {
+            const fullKey = $(this).data('full-key');
+            const category = $(this).data('category');
+            if (category === 'elec_flex') {
+                selectedFlexDevices.push({
+                    fullKey: fullKey,
+                    devType: fullKey.split(':')[1],
+                    category: category
+                });
+            }
+        });
+        
+        if (selectedFlexDevices.length === 0) {
+            showAlert('No flexible devices selected', 'warning');
+            btn.prop('disabled', false).html(originalText);
+            return;
+        }
+        
+        // Get house info for default configs
+        $.ajax({
+            url: '/api/save-house-info',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({
+                size: $('#houseSize').val(),
+                insulation: $('input[name="insulation"]:checked').val(),
+                residents: parseInt($('#residents').val())
+            }),
+            success: function() {
+                // Reset each device to defaults
+                let completed = 0;
+                let successCount = 0;
+                
+                selectedFlexDevices.forEach(function(device) {
+                    $.ajax({
+                        url: '/api/get-device-default',
+                        method: 'POST',
+                        contentType: 'application/json',
+                        data: JSON.stringify({
+                            dev_type: device.devType,
+                            category: device.category
+                        }),
+                        success: function(defaultResponse) {
+                            if (defaultResponse.success && defaultResponse.config) {
+                                // Save default config
+                                $.ajax({
+                                    url: '/api/save-device-config',
+                                    method: 'POST',
+                                    contentType: 'application/json',
+                                    data: JSON.stringify({
+                                        full_key: device.fullKey,
+                                        config: defaultResponse.config
+                                    }),
+                                    success: function() {
+                                        successCount++;
+                                        completed++;
+                                        if (completed === selectedFlexDevices.length) {
+                                            showAlert(`Reset ${successCount} flexible device(s) to default settings`, 'success');
+                                            updateVisualizations();
+                                            updateFlexibleDevicesScheduleList();
+                                            btn.prop('disabled', false).html(originalText);
+                                        }
+                                    },
+                                    error: function() {
+                                        completed++;
+                                        if (completed === selectedFlexDevices.length) {
+                                            const msg = successCount > 0 ? 
+                                                `Reset ${successCount} of ${selectedFlexDevices.length} device(s). Some devices failed to reset.` :
+                                                'Failed to reset devices. Please try again.';
+                                            showAlert(msg, successCount > 0 ? 'warning' : 'danger');
+                                            updateVisualizations();
+                                            updateFlexibleDevicesScheduleList();
+                                            btn.prop('disabled', false).html(originalText);
+                                        }
+                                    }
+                                });
+                            } else {
+                                completed++;
+                                if (completed === selectedFlexDevices.length) {
+                                    const msg = successCount > 0 ? 
+                                        `Reset ${successCount} of ${selectedFlexDevices.length} device(s). Some devices failed to reset.` :
+                                        'Failed to reset devices. Please try again.';
+                                    showAlert(msg, successCount > 0 ? 'warning' : 'danger');
+                                    updateVisualizations();
+                                    updateFlexibleDevicesScheduleList();
+                                    btn.prop('disabled', false).html(originalText);
+                                }
+                            }
+                        },
+                        error: function() {
+                            completed++;
+                            if (completed === selectedFlexDevices.length) {
+                                const msg = successCount > 0 ? 
+                                    `Reset ${successCount} of ${selectedFlexDevices.length} device(s). Some devices failed to reset.` :
+                                    'Failed to reset devices. Please try again.';
+                                showAlert(msg, successCount > 0 ? 'warning' : 'danger');
+                                updateVisualizations();
+                                updateFlexibleDevicesScheduleList();
+                                btn.prop('disabled', false).html(originalText);
+                            }
+                        }
+                    });
+                });
+            },
+            error: function() {
+                showAlert('Failed to get house information. Please try again.', 'danger');
+                btn.prop('disabled', false).html(originalText);
+            }
+        });
+    });
+    
+    // Global suggest schedules for all flexible devices
+    $('#suggestAllSchedules').on('click', function() {
+        const btn = $(this);
+        const originalText = btn.html();
+        btn.prop('disabled', true).html('<span class="spinner-border spinner-border-sm me-2"></span>Suggesting...');
+        
+        // Get global settings
+        const wCost = parseFloat($('#flexWCost').val()) || 1.0;
+        const windowMode = $('#flexWindowMode').val() || 'Daytime (08–17)';
+        
+        // Get earliest/latest from window mode
+        let earliest = null;
+        let latest = null;
+        if (windowMode === 'Any time (00–24)') {
+            earliest = '00:00';
+            latest = '23:59';
+        } else if (windowMode === 'Daytime (08–17)') {
+            earliest = '08:00';
+            latest = '17:00';
+        } else if (windowMode === 'Evening (17–23)') {
+            earliest = '17:00';
+            latest = '23:00';
+        } else if (windowMode === 'Night (00–06)') {
+            earliest = '00:00';
+            latest = '06:00';
+        } else if (windowMode === 'Custom') {
+            earliest = $('#flexEarliest').val() || '07:00';
+            latest = $('#flexLatest').val() || '22:00';
+        }
+        
+        // Get all selected flexible devices
+        const selectedFlexDevices = [];
+        $('.device-checkbox:checked').each(function() {
+            const fullKey = $(this).data('full-key');
+            const category = $(this).data('category');
+            if (category === 'elec_flex') {
+                selectedFlexDevices.push(fullKey);
+            }
+        });
+        
+        if (selectedFlexDevices.length === 0) {
+            showAlert('Please select at least one flexible device first', 'warning');
+            btn.prop('disabled', false).html(originalText);
+            return;
+        }
+        
+        // Fetch configs and suggest intervals SEQUENTIALLY to avoid race conditions
+        const suggestions = [];
+        let failed = 0;
+        
+        console.log('DEBUG suggestAllSchedules: windowMode=', windowMode, 'earliest=', earliest, 'latest=', latest, 'wCost=', wCost);
+        console.log('DEBUG suggestAllSchedules: Processing', selectedFlexDevices.length, 'devices sequentially');
+        
+        // Process devices one at a time using async/await pattern
+        async function processDevicesSequentially() {
+            for (const fullKey of selectedFlexDevices) {
+                try {
+                    // Get config for this device
+                    const configResponse = await $.ajax({
+                        url: '/api/get-device-config',
+                        method: 'POST',
+                        contentType: 'application/json',
+                        data: JSON.stringify({
+                            full_key: fullKey,
+                            dev_type: fullKey.split(':')[1],
+                            category: 'elec_flex'
+                        })
+                    });
+                    
+                    const config = configResponse.config || {};
+                    const durationMin = config.duration_min || 90;
+                    
+                    console.log('DEBUG suggestAllSchedules: Calling suggest for', fullKey, 'duration=', durationMin);
+                    
+                    // Suggest interval for this device
+                    const suggestResponse = await $.ajax({
+                        url: '/api/suggest-interval',
+                        method: 'POST',
+                        contentType: 'application/json',
+                        data: JSON.stringify({
+                            duration_min: durationMin,
+                            w_cost: wCost,
+                            earliest: earliest,
+                            latest: latest
+                        })
+                    });
+                    
+                    console.log('DEBUG suggestAllSchedules: Response for', fullKey, ':', suggestResponse);
+                    
+                    if (suggestResponse.success && suggestResponse.interval) {
+                        console.log('DEBUG suggestAllSchedules: SUCCESS for', fullKey, 'interval=', suggestResponse.interval);
+                        suggestions.push({
+                            fullKey: fullKey,
+                            interval: suggestResponse.interval,
+                            durationMin: durationMin
+                        });
+                    } else {
+                        console.log('DEBUG suggestAllSchedules: FAILED for', fullKey, 'error=', suggestResponse.error || 'no interval returned');
+                        // Fallback: if suggestion failed, use window start time
+                        if (earliest && durationMin) {
+                            const [eh, em] = earliest.split(':').map(Number);
+                            const fallbackStart = earliest;
+                            const endDate = new Date(2025, 0, 10, eh, em);
+                            endDate.setMinutes(endDate.getMinutes() + durationMin);
+                            const fallbackEnd = String(endDate.getHours()).padStart(2, '0') + ':' + String(endDate.getMinutes()).padStart(2, '0');
+                            console.log('DEBUG suggestAllSchedules: Using FALLBACK for', fullKey, ':', fallbackStart, '-', fallbackEnd);
+                            suggestions.push({
+                                fullKey: fullKey,
+                                interval: { start: fallbackStart, end: fallbackEnd },
+                                durationMin: durationMin
+                            });
+                        } else {
+                            failed++;
+                        }
+                    }
+                } catch (error) {
+                    console.log('DEBUG suggestAllSchedules: ERROR for', fullKey, error);
+                    failed++;
+                }
+            }
+            
+            // All devices processed
+            checkComplete();
+        }
+        
+        processDevicesSequentially();
+        
+        function checkComplete() {
+            // All devices have been processed (sequential processing)
+            console.log('DEBUG checkComplete: suggestions=', suggestions.length, 'failed=', failed, 'total=', selectedFlexDevices.length);
+            
+            if (suggestions.length > 0) {
+                // Save all suggestions SEQUENTIALLY to avoid race conditions
+                let savedCount = 0;
+                let saveErrors = 0;
+                
+                async function saveAllSequentially() {
+                    for (const suggestion of suggestions) {
+                        try {
+                            console.log('DEBUG saveAllSequentially: Saving', suggestion.fullKey, 'with interval', suggestion.interval);
+                            
+                            // Get current config
+                            const configResponse = await $.ajax({
+                                url: '/api/get-device-config',
+                                method: 'POST',
+                                contentType: 'application/json',
+                                data: JSON.stringify({
+                                    full_key: suggestion.fullKey,
+                                    dev_type: suggestion.fullKey.split(':')[1],
+                                    category: 'elec_flex'
+                                })
+                            });
+                            
+                            const config = configResponse.config || {};
+                            config.intervals = [{
+                                start: suggestion.interval.start,
+                                end: suggestion.interval.end
+                            }];
+                            config.start = suggestion.interval.start;
+                            config.w_cost = wCost;
+                            
+                            console.log('DEBUG saveAllSequentially: Saving config for', suggestion.fullKey, config.intervals);
+                            
+                            // Save updated config
+                            await $.ajax({
+                                url: '/api/save-device-config',
+                                method: 'POST',
+                                contentType: 'application/json',
+                                data: JSON.stringify({
+                                    full_key: suggestion.fullKey,
+                                    config: config
+                                })
+                            });
+                            
+                            console.log('DEBUG saveAllSequentially: SUCCESS saved', suggestion.fullKey);
+                            savedCount++;
+                        } catch (error) {
+                            console.log('DEBUG saveAllSequentially: ERROR saving', suggestion.fullKey, error);
+                            saveErrors++;
+                        }
+                    }
+                    
+                    // All done
+                    let msg = `Suggested schedules for ${savedCount} of ${selectedFlexDevices.length} device(s)`;
+                    if (failed > 0 || saveErrors > 0) {
+                        const totalFailed = failed + saveErrors;
+                        msg += `. ${totalFailed} device(s) could not be scheduled.`;
+                        showAlert(msg, 'warning');
+                    } else {
+                        showAlert(msg, 'success');
+                    }
+                    updateVisualizations();
+                    updateFlexibleDevicesScheduleList();
+                }
+                
+                saveAllSequentially();
+            } else {
+                showAlert(`Could not suggest intervals for any device. The selected time window (${windowMode}) may not have enough price/CO2 data. Try a different window or fetch data for a different period.`, 'warning');
+            }
+            btn.prop('disabled', false).html(originalText);
+        }
+    });
+    
+    // Device selection
+    $('.device-checkbox').on('change', function() {
+        const fullKey = $(this).data('full-key');
+        const devType = $(this).data('dev-type');
+        const category = $(this).data('category');
+        const isChecked = $(this).is(':checked');
+        const card = $('#deviceCard_' + fullKey.replace(/:/g, '_'));
+        const configBtn = card.find('.device-config-btn');
+        
+        // Save selection first
+        const selection = {};
+        selection[fullKey] = isChecked;
+        
+        if (isChecked) {
+            card.addClass('border-primary');
+            configBtn.prop('disabled', false);
+            
+            // Check if config already exists
+            $.ajax({
+                url: '/api/get-device-config',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({
+                    full_key: fullKey,
+                    dev_type: devType,
+                    category: category
+                }),
+                success: function(configResponse) {
+                    console.log('Config check response:', configResponse);
+                    // Save selection first
+                    $.ajax({
+                        url: '/api/save-device-selection',
+                        method: 'POST',
+                        contentType: 'application/json',
+                        data: JSON.stringify({selection: selection}),
+                        success: function() {
+                            console.log('Selection saved for', fullKey);
+                            // If no config exists, get and save default config
+                            if (!configResponse.success || !configResponse.config || Object.keys(configResponse.config).length === 0) {
+                                console.log('No config found, fetching defaults for', fullKey);
+                                $.ajax({
+                                    url: '/api/get-device-default',
+                                    method: 'POST',
+                                    contentType: 'application/json',
+                                    data: JSON.stringify({
+                                        dev_type: devType,
+                                        category: category
+                                    }),
+                                    success: function(defaultResponse) {
+                                        if (defaultResponse.success && defaultResponse.config) {
+                                            console.log('Saving default config for', fullKey, ':', defaultResponse.config);
+                                            console.log('Intervals in default config:', defaultResponse.config.intervals);
+                                            
+                                            // Ensure intervals are present and in correct format
+                                            const configToSave = JSON.parse(JSON.stringify(defaultResponse.config));
+                                            if (!configToSave.intervals || configToSave.intervals.length === 0) {
+                                                console.error('WARNING: Default config has no intervals!', configToSave);
+                                            }
+                                            
+                                            // Save default config
+                                            $.ajax({
+                                                url: '/api/save-device-config',
+                                                method: 'POST',
+                                                contentType: 'application/json',
+                                                data: JSON.stringify({
+                                                    full_key: fullKey,
+                                                    config: configToSave
+                                                }),
+                                                success: function(saveResponse) {
+                                                    console.log('Config saved successfully for', fullKey, 'response:', saveResponse);
+                                                    
+                                                    // Verify config was saved by fetching it back
+                                                    setTimeout(function() {
+                                                        $.ajax({
+                                                            url: '/api/get-device-config',
+                                                            method: 'POST',
+                                                            contentType: 'application/json',
+                                                            data: JSON.stringify({
+                                                                full_key: fullKey,
+                                                                dev_type: devType,
+                                                                category: category
+                                                            }),
+                                                            success: function(verifyResponse) {
+                                                                console.log('Verified saved config for', fullKey, ':', verifyResponse);
+                                                                if (verifyResponse.success && verifyResponse.config && verifyResponse.config.intervals) {
+                                                                    console.log('Intervals in saved config:', verifyResponse.config.intervals);
+                                                                    updateVisualizations();
+                                                                } else {
+                                                                    console.error('Config verification failed or no intervals found');
+                                                                    // Retry saving
+                                                                    setTimeout(function() {
+                                                                        updateVisualizations();
+                                                                    }, 200);
+                                                                }
+                                                            },
+                                                            error: function() {
+                                                                console.error('Failed to verify config');
+                                                                setTimeout(function() {
+                                                                    updateVisualizations();
+                                                                }, 200);
+                                                            }
+                                                        });
+                                                    }, 100);
+                                                },
+                                                error: function() {
+                                                    console.error('Failed to save config');
+                                                    updateVisualizations();
+                                                }
+                                            });
+                                        } else {
+                                            console.warn('No default config received');
+                                            updateVisualizations();
+                                        }
+                                    },
+                                    error: function() {
+                                        updateVisualizations();
+                                    }
+                                });
+                            } else {
+                                // Config already exists, just update visualizations
+                                updateVisualizations();
+                            }
+                        }
+                    });
+                },
+                error: function() {
+                    // If get-config fails, just save selection and update
+                    $.ajax({
+                        url: '/api/save-device-selection',
+                        method: 'POST',
+                        contentType: 'application/json',
+                        data: JSON.stringify({selection: selection}),
+                        success: function() {
+                            updateVisualizations();
+                        }
+                    });
+                }
+            });
+        } else {
+            card.removeClass('border-primary');
+            configBtn.prop('disabled', true);
+            
+            // Save selection
+            $.ajax({
+                url: '/api/save-device-selection',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({selection: selection}),
+                success: function() {
+                    updateVisualizations();
+                }
+            });
+        }
+    });
+    
+    // Device configuration button - use event delegation for dynamically added buttons
+    $(document).on('click', '.device-config-btn', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        
+        const $btn = $(this);
+        const fullKey = $btn.data('full-key');
+        const devType = $btn.data('dev-type');
+        const category = $btn.data('category');
+        
+        console.log('Config button clicked:', {fullKey, devType, category});
+        
+        if (!fullKey || !devType || !category) {
+            console.error('Missing device data:', {fullKey, devType, category});
+            showAlert('Error: Missing device information', 'danger');
+            return;
+        }
+        
+        // Load current config or get default
+        loadDeviceConfig(fullKey, devType, category);
+    });
+    
+    function loadDeviceConfig(fullKey, devType, category) {
+        console.log('loadDeviceConfig called:', {fullKey, devType, category});
+        
+        const modalTitle = $('#deviceConfigModalTitle');
+        const modalBody = $('#deviceConfigModalBody');
+        
+        if (!modalTitle.length || !modalBody.length) {
+            console.error('Modal elements not found!');
+            showAlert('Error: Modal not found', 'danger');
+            return;
+        }
+        
+        // Get device label
+        const deviceLabels = {{ device_categories | tojson }};
+        const label = deviceLabels[category]?.devices?.find(d => d[0] === devType)?.[1] || fullKey;
+        modalTitle.text(`Configure: ${label}`);
+        
+        // Show loading state
+        modalBody.html('<div class="text-center"><div class="spinner-border" role="status"><span class="visually-hidden">Loading...</span></div></div>');
+        
+        // Try to show modal first
+        const modal = new bootstrap.Modal(document.getElementById('deviceConfigModal'));
+        modal.show();
+        
+        // Always fetch current config from server to get latest saved values
+        // First check if we have a saved config, otherwise get defaults
+        $.ajax({
+            url: '/api/get-device-config',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({
+                full_key: fullKey,
+                dev_type: devType,
+                category: category
+            }),
+            success: function(response) {
+                console.log('Config received from server:', response);
+                if (response.success) {
+                    if (response.config && Object.keys(response.config).length > 0) {
+                        // Use saved config
+                        console.log('Using saved config:', response.config);
+                        populateConfigModal(fullKey, devType, category, label, response.config);
+                    } else {
+                        // No saved config, get defaults
+                        console.log('No saved config, fetching defaults...');
+                        fetchDefaultConfig(fullKey, devType, category, label);
+                    }
+                } else {
+                    console.error('Failed to get config:', response.error);
+                    fetchDefaultConfig(fullKey, devType, category, label);
+                }
+            },
+            error: function(xhr, status, error) {
+                console.error('Error getting config:', error, xhr);
+                fetchDefaultConfig(fullKey, devType, category, label);
+            }
+        });
+    }
+    
+    function fetchDefaultConfig(fullKey, devType, category, label) {
+        $.ajax({
+            url: '/api/get-device-default',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({
+                dev_type: devType,
+                category: category
+            }),
+            success: function(response) {
+                console.log('Default config received:', response);
+                if (response.success) {
+                    populateConfigModal(fullKey, devType, category, label, response.config);
+                } else {
+                    console.error('Failed to get default config:', response.error);
+                    populateConfigModal(fullKey, devType, category, label, {});
+                }
+            },
+            error: function(xhr, status, error) {
+                console.error('Error getting default config:', error, xhr);
+                populateConfigModal(fullKey, devType, category, label, {});
+            }
+        });
+    }
+    
+    function populateConfigModal(fullKey, devType, category, label, config) {
+        console.log('populateConfigModal called:', {fullKey, devType, category, config});
+        
+        const modalBody = $('#deviceConfigModalBody');
+        
+        if (!modalBody.length) {
+            console.error('Modal body not found!');
+            return;
+        }
+        
+        let html = '';
+        
+        // Custom name for "other*" devices
+        if (devType.startsWith('other')) {
+            const baseLabel = label.includes(' ') ? label.split(' ', 2)[1] : label;
+            html += `
+                <div class="mb-3">
+                    <label class="form-label">Name of this device</label>
+                    <input type="text" class="form-control" id="configCustomName" 
+                           value="${(config.custom_name || baseLabel).replace(/"/g, '&quot;')}" 
+                           placeholder="E.g. '3D printer', 'Aquarium pump', 'Server rack', etc.">
+                    <small class="form-text text-muted">Custom name for this device</small>
+                </div>
+            `;
+        }
+        
+        // Escape values for HTML
+        const numDevices = config.num_devices || 1;
+        const powerW = config.power_w || (config.power_kw ? config.power_kw * 1000 : 8.0);
+        
+        html += `
+            <div class="mb-3">
+                <label class="form-label">Number of devices</label>
+                <input type="number" class="form-control" id="configNumDevices" min="1" max="30" value="${numDevices}">
+            </div>
+            <div class="mb-3">
+                <label class="form-label">Power per device (W)</label>
+                <input type="number" class="form-control" id="configPowerW" min="0" max="5000" step="10" value="${powerW}">
+            </div>
+        `;
+        
+        if (category === 'elec_flex') {
+            const durationMin = config.duration_min || 90;
+            // Get start/end from intervals if available, otherwise calculate from start + duration
+            let startTime, endTime;
+            if (config.intervals && config.intervals.length > 0) {
+                startTime = config.intervals[0].start;
+                endTime = config.intervals[0].end;
+            } else if (config.start) {
+                // Calculate end from start + duration
+                startTime = config.start;
+                const [hours, minutes] = startTime.split(':');
+                const startDate = new Date(2025, 0, 10, parseInt(hours), parseInt(minutes));
+                const endDate = new Date(startDate.getTime() + (durationMin * 60000));
+                endTime = `${String(endDate.getHours()).padStart(2, '0')}:${String(endDate.getMinutes()).padStart(2, '0')}`;
+            } else {
+                startTime = '20:00';
+                endTime = '21:30';
+            }
+            
+            // Convert to string format for time inputs
+            let startTimeStr, endTimeStr;
+            if (typeof startTime === 'string') {
+                startTimeStr = startTime;
+            } else if (startTime && typeof startTime === 'object' && 'hour' in startTime) {
+                startTimeStr = `${String(startTime.hour || 20).padStart(2, '0')}:${String(startTime.minute || 0).padStart(2, '0')}`;
+            } else {
+                startTimeStr = '20:00';
+            }
+            
+            if (typeof endTime === 'string') {
+                endTimeStr = endTime;
+            } else if (endTime && typeof endTime === 'object' && 'hour' in endTime) {
+                endTimeStr = `${String(endTime.hour || 21).padStart(2, '0')}:${String(endTime.minute || 30).padStart(2, '0')}`;
+            } else {
+                endTimeStr = '21:30';
+            }
+            const wCost = config.w_cost !== undefined ? config.w_cost : 1.0;
+            
+            console.log('DEBUG populateConfigModal elec_flex:', {
+                config: config,
+                durationMin: durationMin,
+                startTime: startTime,
+                endTime: endTime,
+                startTimeStr: startTimeStr,
+                endTimeStr: endTimeStr
+            });
+            
+            html += `
+                <div class="mb-3">
+                    <label class="form-label">Operation duration (minutes)</label>
+                    <input type="number" class="form-control" id="configDurationMin" min="15" max="600" step="15" value="${durationMin}">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Current scheduled interval (one continuous block)</label>
+                    <div class="row">
+                        <div class="col-6">
+                            <label class="form-label small">Start</label>
+                            <input type="time" class="form-control" id="configStartTime" value="${startTimeStr}">
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label small">End (computed)</label>
+                            <input type="time" class="form-control" id="configEndTime" value="${endTimeStr}" readonly>
+                        </div>
+                    </div>
+                    <small class="text-muted">End time is automatically calculated from start time + duration</small>
+                    <div class="alert alert-info mt-2 mb-0">
+                        <small><i class="bi bi-info-circle me-1"></i>Use the global "Suggest schedules" button in the Flexible Load Settings section above to find optimal intervals for all flexible devices.</small>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Daily load profile (preview)</label>
+                    <div id="profilePreview" style="height: 150px;"></div>
+                </div>
+            `;
+        } else if (category === 'elec_fixed') {
+            html += `
+                <div class="mb-3">
+                    <label class="form-label">On/Off Intervals (you can add multiple)</label>
+                    <div id="intervalsContainer"></div>
+                    <button type="button" class="btn btn-sm btn-outline-primary mt-2" id="addInterval">
+                        <i class="bi bi-plus-circle me-1"></i>Add Interval
+                    </button>
+                </div>
+                <div class="mb-3">
+                    <div id="profilePreview" style="height: 150px;"></div>
+                </div>
+            `;
+        } else if (category === 'thermal') {
+            // Remove the generic num_devices and power_w fields for thermal devices
+            html = '';
+            
+            if (devType === 'space_heat') {
+                const spaceMode = config.space_mode || 'None (external supply)';
+                const tMinC = config.t_min_c || 20;
+                const tMaxC = config.t_max_c || 22;
+                const qKw = config.q_kw || 6;
+                const hpType = config.hp_type || 'Fixed power';
+                const distribution = config.distribution || 'Radiators';
+                
+                html = `
+                    <div class="mb-3">
+                        <label class="form-label fw-bold">Heating system</label>
+                        <select class="form-select" id="modalSpaceMode">
+                            <option value="None (external supply)" ${spaceMode === 'None (external supply)' ? 'selected' : ''}>None (external supply)</option>
+                            <option value="Electric panels" ${spaceMode === 'Electric panels' ? 'selected' : ''}>Electric panels</option>
+                            <option value="Heat pump – air-to-air" ${spaceMode === 'Heat pump – air-to-air' ? 'selected' : ''}>Heat pump – air-to-air</option>
+                            <option value="Heat pump – air-to-water" ${spaceMode === 'Heat pump – air-to-water' ? 'selected' : ''}>Heat pump – air-to-water</option>
+                        </select>
+                        <small class="text-muted" id="modalSpaceModeHelp">District heating, gas, or external boiler</small>
+                    </div>
+                    
+                    <div id="modalSpaceSettings" style="display: ${spaceMode !== 'None (external supply)' ? 'block' : 'none'};">
+                        <div class="row g-2 mb-3">
+                            <div class="col-6">
+                                <label class="form-label">Min temp (°C)</label>
+                                <input type="number" class="form-control" id="modalSpaceTempMin" value="${tMinC}" min="5" max="30" step="0.5">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label">Max temp (°C)</label>
+                                <input type="number" class="form-control" id="modalSpaceTempMax" value="${tMaxC}" min="5" max="30" step="0.5">
+                            </div>
+                        </div>
+                        
+                        <div class="mb-3">
+                            <label class="form-label">Heater capacity (kW)</label>
+                            <input type="number" class="form-control" id="modalSpaceHeaterKw" value="${qKw}" min="1" max="30" step="0.5">
+                        </div>
+                        
+                        <div id="modalHpTypeSettings" style="display: ${spaceMode.includes('Heat pump') ? 'block' : 'none'};">
+                            <div class="mb-3">
+                                <label class="form-label">Heat pump type</label>
+                                <div class="btn-group w-100" role="group">
+                                    <input type="radio" class="btn-check" name="modalHpType" id="modalHpTypeFixed" value="Fixed power" ${hpType === 'Fixed power' ? 'checked' : ''}>
+                                    <label class="btn btn-outline-secondary" for="modalHpTypeFixed">Fixed</label>
+                                    <input type="radio" class="btn-check" name="modalHpType" id="modalHpTypeVariable" value="Variable power" ${hpType === 'Variable power' ? 'checked' : ''}>
+                                    <label class="btn btn-outline-secondary" for="modalHpTypeVariable">Variable</label>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div id="modalDistributionSettings" style="display: ${spaceMode === 'Heat pump – air-to-water' ? 'block' : 'none'};">
+                            <div class="mb-3">
+                                <label class="form-label">Distribution system</label>
+                                <select class="form-select" id="modalHeatDistribution">
+                                    <option value="Radiators" ${distribution === 'Radiators' ? 'selected' : ''}>Radiators</option>
+                                    <option value="Floor heating" ${distribution === 'Floor heating' ? 'selected' : ''}>Floor heating</option>
+                                    <option value="Both" ${distribution === 'Both' ? 'selected' : ''}>Both</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="mt-3">
+                        <label class="form-label">Power profile preview:</label>
+                        <div id="modalThermalChart" style="height: 150px;"></div>
+                    </div>
+                `;
+            } else if (devType === 'dhw') {
+                const dhwMode = config.dhw_mode || 'None (external supply)';
+                const volumeL = config.volume_l || 200;
+                const usageLevel = config.usage_level || 'Medium';
+                const tMinC = config.t_min_c || 45;
+                const tMaxC = config.t_max_c || 55;
+                const pElKw = config.p_el_kw || 2;
+                
+                html = `
+                    <div class="mb-3">
+                        <label class="form-label fw-bold">DHW system</label>
+                        <select class="form-select" id="modalDhwMode">
+                            <option value="None (external supply)" ${dhwMode === 'None (external supply)' ? 'selected' : ''}>None (external supply)</option>
+                            <option value="Electric DHW tank" ${dhwMode === 'Electric DHW tank' ? 'selected' : ''}>Electric DHW tank</option>
+                            <option value="Heat pump DHW tank" ${dhwMode === 'Heat pump DHW tank' ? 'selected' : ''}>Heat pump DHW tank</option>
+                        </select>
+                        <small class="text-muted" id="modalDhwModeHelp">District heating or shared system</small>
+                    </div>
+                    
+                    <div id="modalDhwSettings" style="display: ${dhwMode !== 'None (external supply)' ? 'block' : 'none'};">
+                        <div class="row g-2 mb-3">
+                            <div class="col-6">
+                                <label class="form-label">Tank volume (L)</label>
+                                <input type="number" class="form-control" id="modalDhwVolume" value="${volumeL}" min="50" max="500" step="25">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label">Usage level</label>
+                                <select class="form-select" id="modalDhwUsage">
+                                    <option value="Low" ${usageLevel === 'Low' ? 'selected' : ''}>Low (1-2 persons)</option>
+                                    <option value="Medium" ${usageLevel === 'Medium' ? 'selected' : ''}>Medium (3-4)</option>
+                                    <option value="High" ${usageLevel === 'High' ? 'selected' : ''}>High (5+)</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="row g-2 mb-3">
+                            <div class="col-6">
+                                <label class="form-label">Min temp (°C)</label>
+                                <input type="number" class="form-control" id="modalDhwTempMin" value="${tMinC}" min="30" max="70" step="1">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label">Max temp (°C)</label>
+                                <input type="number" class="form-control" id="modalDhwTempMax" value="${tMaxC}" min="30" max="70" step="1">
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Heater power (kW)</label>
+                            <input type="number" class="form-control" id="modalDhwHeaterKw" value="${pElKw}" min="0.5" max="10" step="0.5">
+                        </div>
+                    </div>
+                    
+                    <div class="mt-3">
+                        <label class="form-label">Power profile preview:</label>
+                        <div id="modalThermalChart" style="height: 150px;"></div>
+                    </div>
+                `;
+            } else if (devType === 'leisure') {
+                const hotTubEnabled = config.hot_tub_enabled || false;
+                const poolEnabled = config.pool_enabled || false;
+                const htTargetC = config.ht_target_c || 40;
+                const htIdleC = config.ht_idle_c || 30;
+                const htWaterL = config.ht_water_l || 1200;
+                const htHeaterKw = config.ht_heater_kw || 5;
+                const poolTargetC = config.pool_target_c || 28;
+                const poolIdleC = config.pool_idle_c || 24;
+                const poolWaterL = config.pool_water_l || 30000;
+                const poolHeaterKw = config.pool_heater_kw || 15;
+                
+                html = `
+                    <div class="mb-3">
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" id="modalHotTubEnabled" ${hotTubEnabled ? 'checked' : ''}>
+                            <label class="form-check-label fw-bold" for="modalHotTubEnabled">🛁 Hot tub / Spa</label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="modalPoolEnabled" ${poolEnabled ? 'checked' : ''}>
+                            <label class="form-check-label fw-bold" for="modalPoolEnabled">🏊 Pool heater</label>
+                        </div>
+                    </div>
+                    
+                    <div id="modalHotTubSettings" style="display: ${hotTubEnabled ? 'block' : 'none'};">
+                        <hr>
+                        <h6 class="fw-bold">🛁 Hot Tub Settings</h6>
+                        <div class="row g-2 mb-3">
+                            <div class="col-6">
+                                <label class="form-label">Target temp (°C)</label>
+                                <input type="number" class="form-control" id="modalHtTargetTemp" value="${htTargetC}" min="25" max="45" step="0.5">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label">Idle temp (°C)</label>
+                                <input type="number" class="form-control" id="modalHtIdleTemp" value="${htIdleC}" min="10" max="40" step="0.5">
+                            </div>
+                        </div>
+                        <div class="row g-2 mb-3">
+                            <div class="col-6">
+                                <label class="form-label">Volume (L)</label>
+                                <input type="number" class="form-control" id="modalHtVolume" value="${htWaterL}" min="400" max="3000" step="50">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label">Heater (kW)</label>
+                                <input type="number" class="form-control" id="modalHtHeaterKw" value="${htHeaterKw}" min="1" max="12" step="0.5">
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Use Sessions</label>
+                            <div id="modalHtSessionsList"></div>
+                            <button type="button" class="btn btn-sm btn-outline-success mt-1" id="modalAddHtSession">
+                                <i class="bi bi-plus"></i> Add session
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div id="modalPoolSettings" style="display: ${poolEnabled ? 'block' : 'none'};">
+                        <hr>
+                        <h6 class="fw-bold">🏊 Pool Settings</h6>
+                        <small class="text-muted d-block mb-2">Pool uses heat pump (COP ≈ 3.5)</small>
+                        <div class="row g-2 mb-3">
+                            <div class="col-6">
+                                <label class="form-label">Target temp (°C)</label>
+                                <input type="number" class="form-control" id="modalPoolTargetTemp" value="${poolTargetC}" min="20" max="35" step="0.5">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label">Idle temp (°C)</label>
+                                <input type="number" class="form-control" id="modalPoolIdleTemp" value="${poolIdleC}" min="15" max="30" step="0.5">
+                            </div>
+                        </div>
+                        <div class="row g-2 mb-3">
+                            <div class="col-6">
+                                <label class="form-label">Volume (L)</label>
+                                <input type="number" class="form-control" id="modalPoolVolume" value="${poolWaterL}" min="5000" max="100000" step="1000">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label">Heater (kW thermal)</label>
+                                <input type="number" class="form-control" id="modalPoolHeaterKw" value="${poolHeaterKw}" min="2" max="40" step="1">
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="mt-3">
+                        <label class="form-label">Power profile preview:</label>
+                        <div id="modalThermalChart" style="height: 150px;"></div>
+                    </div>
+                `;
+            }
+        }
+        
+        modalBody.html(html);
+        
+        // Load intervals for fixed devices
+        if (category === 'elec_fixed') {
+            const intervals = config.intervals || [];
+            console.log('Loading intervals for fixed device:', intervals);
+            
+            if (intervals.length === 0) {
+                // Default intervals for lights (from original code)
+                if (devType === 'lights') {
+                    addIntervalRow('06:00', '08:00');
+                    addIntervalRow('17:00', '23:00');
+                } else {
+                    addIntervalRow('18:00', '23:00');
+                }
+            } else {
+                intervals.forEach((iv, idx) => {
+                    // Convert time objects to strings if needed
+                    let start, end;
+                    if (typeof iv.start === 'string') {
+                        start = iv.start;
+                    } else if (iv.start && typeof iv.start === 'object') {
+                        start = `${String(iv.start.hour || 18).padStart(2, '0')}:${String(iv.start.minute || 0).padStart(2, '0')}`;
+                    } else {
+                        start = '18:00';
+                    }
+                    
+                    if (typeof iv.end === 'string') {
+                        end = iv.end;
+                    } else if (iv.end && typeof iv.end === 'object') {
+                        end = `${String(iv.end.hour || 23).padStart(2, '0')}:${String(iv.end.minute || 0).padStart(2, '0')}`;
+                    } else {
+                        end = '23:00';
+                    }
+                    addIntervalRow(start, end, idx);
+                });
+            }
+        }
+        
+        // Store current config data (including label for preview title)
+        modalBody.data('full-key', fullKey);
+        modalBody.data('dev-type', devType);
+        modalBody.data('category', category);
+        modalBody.data('device-label', label);
+        
+        // Update profile preview when values change - use event delegation
+        setTimeout(function() {
+            $(document).off('input change', '#configNumDevices, #configPowerW, #configDurationMin, #configStartTime');
+            $(document).on('input change', '#configNumDevices, #configPowerW, #configDurationMin, #configStartTime', function() {
+                if (category === 'elec_flex') {
+                    // Update end time when start or duration changes
+                    updateFlexEndTime();
+                }
+                updateProfilePreview();
+            });
+            // Also listen to interval changes for fixed devices
+            $(document).on('change', '.interval-start, .interval-end', function() {
+                updateProfilePreview();
+            });
+            
+            // Handle thermal device modal events
+            if (category === 'thermal') {
+                setupThermalModalHandlers(devType, config);
+            }
+            
+            // For flexible devices, ensure end time is calculated and preview is shown
+            if (category === 'elec_flex') {
+                // Use multiple timeouts to ensure DOM is ready and values are set
+                setTimeout(function() {
+                    // First, make sure inputs exist and have values
+                    if ($('#configStartTime').length && $('#configEndTime').length && $('#configDurationMin').length) {
+                        // Get the current values
+                        const startTime = $('#configStartTime').val();
+                        const durationMin = parseInt($('#configDurationMin').val()) || 90;
+                        
+                        // Always recalculate end time to ensure it's correct
+                        updateFlexEndTime();
+                        
+                        // Wait a bit for the end time to be set, then update preview
+                        setTimeout(function() {
+                            const endTime = $('#configEndTime').val();
+                            console.log('DEBUG: Modal setup complete - Start time =', startTime, 'End time =', endTime, 'Duration =', durationMin);
+                            updateProfilePreview();
+                        }, 100);
+                    } else {
+                        console.warn('DEBUG: Inputs not found, retrying...');
+                        setTimeout(function() {
+                            if ($('#configStartTime').length && $('#configEndTime').length && $('#configDurationMin').length) {
+                                updateFlexEndTime();
+                                setTimeout(function() {
+                                    updateProfilePreview();
+                                }, 100);
+                            }
+                        }, 200);
+                    }
+                }, 100);
+            } else if (category !== 'thermal') {
+                updateProfilePreview();
+            }
+        }, 200);
+    }
+    
+    let modalThermalPreviewTimeout = null;
+    
+    function setupThermalModalHandlers(devType, config) {
+        // Common function to update modal thermal preview (debounced)
+        function updateModalThermalPreview() {
+            // Debounce to prevent multiple rapid calls
+            if (modalThermalPreviewTimeout) {
+                clearTimeout(modalThermalPreviewTimeout);
+            }
+            
+            modalThermalPreviewTimeout = setTimeout(function() {
+                doUpdateModalThermalPreview();
+            }, 150);
+        }
+        
+        function doUpdateModalThermalPreview() {
+            const chartEl = $('#modalThermalChart');
+            if (!chartEl.length) return;
+            
+            // Gather current config from modal
+            let modalConfig = {};
+            if (devType === 'space_heat') {
+                modalConfig = {
+                    space_mode: $('#modalSpaceMode').val(),
+                    t_min_c: parseFloat($('#modalSpaceTempMin').val()) || 20,
+                    t_max_c: parseFloat($('#modalSpaceTempMax').val()) || 22,
+                    q_kw: parseFloat($('#modalSpaceHeaterKw').val()) || 6,
+                    hp_type: $('input[name="modalHpType"]:checked').val() || 'Fixed power',
+                    distribution: $('#modalHeatDistribution').val() || 'Radiators'
+                };
+            } else if (devType === 'dhw') {
+                modalConfig = {
+                    dhw_mode: $('#modalDhwMode').val(),
+                    volume_l: parseFloat($('#modalDhwVolume').val()) || 200,
+                    usage_level: $('#modalDhwUsage').val() || 'Medium',
+                    t_min_c: parseFloat($('#modalDhwTempMin').val()) || 45,
+                    t_max_c: parseFloat($('#modalDhwTempMax').val()) || 55,
+                    p_el_kw: parseFloat($('#modalDhwHeaterKw').val()) || 2
+                };
+            } else if (devType === 'leisure') {
+                const htSessions = [];
+                $('#modalHtSessionsList .ht-session-row').each(function() {
+                    const start = $(this).find('.ht-session-start').val();
+                    const end = $(this).find('.ht-session-end').val();
+                    if (start && end) htSessions.push({start: start, end: end});
+                });
+                modalConfig = {
+                    hot_tub_enabled: $('#modalHotTubEnabled').is(':checked'),
+                    pool_enabled: $('#modalPoolEnabled').is(':checked'),
+                    ht_target_c: parseFloat($('#modalHtTargetTemp').val()) || 40,
+                    ht_idle_c: parseFloat($('#modalHtIdleTemp').val()) || 30,
+                    ht_water_l: parseFloat($('#modalHtVolume').val()) || 1200,
+                    ht_heater_kw: parseFloat($('#modalHtHeaterKw').val()) || 5,
+                    ht_sessions: htSessions,
+                    pool_target_c: parseFloat($('#modalPoolTargetTemp').val()) || 28,
+                    pool_idle_c: parseFloat($('#modalPoolIdleTemp').val()) || 24,
+                    pool_water_l: parseFloat($('#modalPoolVolume').val()) || 30000,
+                    pool_heater_kw: parseFloat($('#modalPoolHeaterKw').val()) || 15
+                };
+            }
+            
+            // Compute thermal preview
+            $.ajax({
+                url: '/api/compute-thermal-profiles',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({ preview_config: modalConfig, dev_type: devType }),
+                success: function(response) {
+                    console.log('Modal thermal preview response:', response);
+                    if (response.success && response.profiles) {
+                        // Plot the appropriate profile
+                        let profileObj = null;
+                        let profileName = '';
+                        let profileColor = '#dc3545';
+                        
+                        if (devType === 'space_heat' && response.profiles.space_heat) {
+                            profileObj = response.profiles.space_heat;
+                            profileName = 'Space Heating';
+                            profileColor = '#dc3545';
+                        } else if (devType === 'dhw' && response.profiles.dhw) {
+                            profileObj = response.profiles.dhw;
+                            profileName = 'DHW';
+                            profileColor = '#0dcaf0';
+                        } else if (devType === 'leisure' && response.profiles.leisure) {
+                            profileObj = response.profiles.leisure;
+                            profileName = 'Leisure';
+                            profileColor = '#198754';
+                        }
+                        
+                        // Profile is {index: [...], values: [...]} object
+                        if (profileObj && profileObj.values && profileObj.values.length > 0 && typeof Plotly !== 'undefined') {
+                            // Parse index timestamps
+                            const times = profileObj.index.map(t => new Date(t));
+                            const values = profileObj.values; // Already in kW
+                            
+                            const trace = {
+                                x: times,
+                                y: values,
+                                mode: 'lines',
+                                type: 'scatter',
+                                name: profileName,
+                                line: {color: profileColor, width: 1.5},
+                                fill: 'tozeroy'
+                            };
+                            
+                            Plotly.newPlot('modalThermalChart', [trace], {
+                                xaxis: {title: '', type: 'date', tickformat: '%H:%M'},
+                                yaxis: {title: 'kW'},
+                                height: 150,
+                                margin: {l: 45, r: 10, t: 5, b: 30}
+                            }, {responsive: true, displayModeBar: false});
+                        } else {
+                            chartEl.html('<div class="text-center text-muted py-3"><em>No profile data - adjust settings</em></div>');
+                        }
+                    } else {
+                        chartEl.html('<div class="text-center text-muted py-3"><em>Select a heating system</em></div>');
+                    }
+                },
+                error: function(xhr) {
+                    console.error('Error computing modal thermal preview:', xhr);
+                    chartEl.html('<div class="text-center text-danger py-3"><em>Error computing preview</em></div>');
+                }
+            });
+        }
+        
+        // Space heating modal handlers
+        if (devType === 'space_heat') {
+            // Trigger initial visibility based on current mode
+            const spaceMode = $('#modalSpaceMode').val();
+            if (spaceMode !== 'None (external supply)') {
+                $('#modalSpaceSettings').show();
+                if (spaceMode === 'Electric panels') {
+                    $('#modalHpTypeSettings').hide();
+                    $('#modalDistributionSettings').hide();
+                } else if (spaceMode === 'Heat pump – air-to-air') {
+                    $('#modalHpTypeSettings').show();
+                    $('#modalDistributionSettings').hide();
+                } else if (spaceMode === 'Heat pump – air-to-water') {
+                    $('#modalHpTypeSettings').show();
+                    $('#modalDistributionSettings').show();
+                }
+            }
+            
+            // Listen to mode changes
+            $('#modalSpaceMode').off('change').on('change', function() {
+                const mode = $(this).val();
+                if (mode === 'None (external supply)') {
+                    $('#modalSpaceSettings').hide();
+                    $('#modalSpaceModeHelp').text('District heating, gas, or external boiler');
+                } else {
+                    $('#modalSpaceSettings').show();
+                    if (mode === 'Electric panels') {
+                        $('#modalSpaceModeHelp').text('Direct electric resistance heating');
+                        $('#modalHpTypeSettings').hide();
+                        $('#modalDistributionSettings').hide();
+                    } else if (mode === 'Heat pump – air-to-air') {
+                        $('#modalSpaceModeHelp').text('Air-to-air heat pump (no water distribution)');
+                        $('#modalHpTypeSettings').show();
+                        $('#modalDistributionSettings').hide();
+                    } else if (mode === 'Heat pump – air-to-water') {
+                        $('#modalSpaceModeHelp').text('Air-to-water heat pump with hydronic distribution');
+                        $('#modalHpTypeSettings').show();
+                        $('#modalDistributionSettings').show();
+                    }
+                }
+                updateModalThermalPreview();
+            });
+            
+            // Listen to other field changes for preview update
+            $('#modalSpaceTempMin, #modalSpaceTempMax, #modalSpaceHeaterKw, #modalHeatDistribution').off('change').on('change', updateModalThermalPreview);
+            $('input[name="modalHpType"]').off('change').on('change', updateModalThermalPreview);
+            
+            // Initial preview
+            updateModalThermalPreview();
+        }
+        
+        // DHW modal handlers
+        else if (devType === 'dhw') {
+            $('#modalDhwMode').off('change').on('change', function() {
+                const mode = $(this).val();
+                if (mode === 'None (external supply)') {
+                    $('#modalDhwSettings').hide();
+                    $('#modalDhwModeHelp').text('District heating or shared system');
+                } else {
+                    $('#modalDhwSettings').show();
+                    if (mode === 'Electric DHW tank') {
+                        $('#modalDhwModeHelp').text('Electric resistance water heater (COP = 1)');
+                    } else {
+                        $('#modalDhwModeHelp').text('Heat pump water heater (COP ≈ 2.5)');
+                    }
+                }
+                updateModalThermalPreview();
+            });
+            
+            // Trigger initial visibility based on current mode
+            const dhwMode = $('#modalDhwMode').val();
+            if (dhwMode !== 'None (external supply)') {
+                $('#modalDhwSettings').show();
+            }
+            
+            // Listen to other field changes for preview update
+            $('#modalDhwVolume, #modalDhwUsage, #modalDhwTempMin, #modalDhwTempMax, #modalDhwHeaterKw').off('change').on('change', updateModalThermalPreview);
+            
+            // Initial preview
+            updateModalThermalPreview();
+        }
+        
+        // Leisure modal handlers
+        else if (devType === 'leisure') {
+            $('#modalHotTubEnabled').off('change').on('change', function() {
+                if ($(this).is(':checked')) {
+                    $('#modalHotTubSettings').show();
+                } else {
+                    $('#modalHotTubSettings').hide();
+                }
+                updateModalThermalPreview();
+            });
+            
+            $('#modalPoolEnabled').off('change').on('change', function() {
+                if ($(this).is(':checked')) {
+                    $('#modalPoolSettings').show();
+                } else {
+                    $('#modalPoolSettings').hide();
+                }
+                updateModalThermalPreview();
+            });
+            
+            // Add hot tub session button handler
+            $('#modalAddHtSession').off('click').on('click', function() {
+                addModalHtSessionRow();
+            });
+            
+            // Load existing sessions
+            if (config.ht_sessions && config.ht_sessions.length > 0) {
+                config.ht_sessions.forEach(function(session) {
+                    addModalHtSessionRow(session.start, session.end);
+                });
+            }
+            
+            // Listen to other field changes
+            $('#modalHtTargetTemp, #modalHtIdleTemp, #modalHtVolume, #modalHtHeaterKw').off('change').on('change', updateModalThermalPreview);
+            $('#modalPoolTargetTemp, #modalPoolIdleTemp, #modalPoolVolume, #modalPoolHeaterKw').off('change').on('change', updateModalThermalPreview);
+            
+            // Initial preview
+            updateModalThermalPreview();
+        }
+    }
+    
+    function addModalHtSessionRow(start = '18:00', end = '20:00') {
+        const row = $(`
+            <div class="ht-session-row mb-2 d-flex align-items-end">
+                <div class="col-5 me-2">
+                    <label class="form-label small">Start</label>
+                    <input type="time" class="form-control form-control-sm ht-session-start" value="${start}">
+                </div>
+                <div class="col-5 me-2">
+                    <label class="form-label small">End</label>
+                    <input type="time" class="form-control form-control-sm ht-session-end" value="${end}">
+                </div>
+                <div class="col-2">
+                    <button type="button" class="btn btn-sm btn-outline-danger remove-ht-session" title="Remove session">
+                        <i class="bi bi-trash"></i>
+                    </button>
+                </div>
+            </div>
+        `);
+        $('#modalHtSessionsList').append(row);
+        
+        row.find('.remove-ht-session').on('click', function() {
+            row.remove();
+        });
+    }
+    
+    function addIntervalRow(start = '18:00', end = '23:00', index = null) {
+        if (index === null) {
+            index = $('#intervalsContainer .interval-row').length;
+        }
+        const row = $(`
+            <div class="interval-row mb-2 d-flex align-items-end">
+                <div class="col-5 me-2">
+                    <label class="form-label small">Start</label>
+                    <input type="time" class="form-control form-control-sm interval-start" value="${start}">
+                </div>
+                <div class="col-5 me-2">
+                    <label class="form-label small">End</label>
+                    <input type="time" class="form-control form-control-sm interval-end" value="${end}">
+                </div>
+                <div class="col-2">
+                    <button type="button" class="btn btn-sm btn-outline-danger remove-interval" title="Delete interval">
+                        <i class="bi bi-trash"></i>
+                    </button>
+                </div>
+            </div>
+        `);
+        $('#intervalsContainer').append(row);
+        
+        // Bind change events to interval inputs
+        row.find('.interval-start, .interval-end').on('change', function() {
+            updateProfilePreview();
+        });
+        
+        row.find('.remove-interval').on('click', function() {
+            row.remove();
+            updateProfilePreview();
+        });
+        
+        // Trigger preview update after adding
+        updateProfilePreview();
+    }
+    
+    // Use event delegation for dynamically added buttons
+    $(document).on('click', '#addInterval', function() {
+        addIntervalRow();
+        // updateProfilePreview is called inside addIntervalRow
+    });
+    
+    function updateFlexEndTime() {
+        // Calculate end time from start + duration for flexible devices
+        const startTime = $('#configStartTime').val();
+        const durationMin = parseInt($('#configDurationMin').val()) || 90;
+        
+        if (startTime) {
+            const [hours, minutes] = startTime.split(':');
+            const startDate = new Date(2025, 0, 10, parseInt(hours), parseInt(minutes));
+            const endDate = new Date(startDate.getTime() + durationMin * 60000);
+            
+            const endHours = String(endDate.getHours()).padStart(2, '0');
+            const endMinutes = String(endDate.getMinutes()).padStart(2, '0');
+            $('#configEndTime').val(`${endHours}:${endMinutes}`);
+            console.log('DEBUG updateFlexEndTime: startTime=', startTime, 'durationMin=', durationMin, 'endTime=', `${endHours}:${endMinutes}`);
+        }
+    }
+    
+    function suggestBestInterval() {
+        const durationMin = parseInt($('#configDurationMin').val()) || 90;
+        const wCost = parseFloat($('#configWCost').val()) || 1.0;
+        const windowMode = $('#flexWindowMode').val() || 'Daytime (08–17)';
+        
+        // Get earliest/latest from global settings
+        let earliest = null;
+        let latest = null;
+        
+        if (windowMode === 'Any time (00–24)') {
+            earliest = '00:00';
+            latest = '23:59';
+        } else if (windowMode === 'Daytime (08–17)') {
+            earliest = '08:00';
+            latest = '17:00';
+        } else if (windowMode === 'Evening (17–23)') {
+            earliest = '17:00';
+            latest = '23:00';
+        } else if (windowMode === 'Night (00–06)') {
+            earliest = '00:00';
+            latest = '06:00';
+        } else if (windowMode === 'Custom') {
+            earliest = $('#flexEarliestCustom').val() || '07:00';
+            latest = $('#flexLatestCustom').val() || '22:00';
+        }
+        
+        console.log('DEBUG suggestBestInterval:', {
+            durationMin: durationMin,
+            wCost: wCost,
+            earliest: earliest,
+            latest: latest,
+            windowMode: windowMode
+        });
+        
+        // Show loading state
+        const btn = $('#suggestIntervalBtn');
+        const originalText = btn.html();
+        btn.prop('disabled', true).html('<span class="spinner-border spinner-border-sm me-1"></span>Suggesting...');
+        
+        $.ajax({
+            url: '/api/suggest-interval',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({
+                duration_min: durationMin,
+                w_cost: wCost,
+                earliest: earliest,
+                latest: latest
+            }),
+            success: function(response) {
+                console.log('DEBUG suggestBestInterval response:', response);
+                if (response.success && response.interval) {
+                    $('#configStartTime').val(response.interval.start);
+                    $('#configEndTime').val(response.interval.end);
+                    updateProfilePreview();
+                    showAlert(`Suggested interval: ${response.interval.start}–${response.interval.end}`, 'success');
+                } else {
+                    showAlert(response.error || 'Could not suggest interval', 'warning');
+                }
+            },
+            error: function(xhr) {
+                console.error('ERROR suggestBestInterval:', xhr);
+                const errorMsg = xhr.responseJSON?.error || xhr.statusText || 'Failed to suggest interval';
+                showAlert(errorMsg, 'danger');
+            },
+            complete: function() {
+                btn.prop('disabled', false).html(originalText);
+            }
+        });
+    }
+    
+    function updateProfilePreview() {
+        const category = $('#deviceConfigModalBody').data('category');
+        const deviceLabel = $('#deviceConfigModalBody').data('device-label') || 'Device';
+        // Extract device name from label (remove emoji if present)
+        const deviceName = deviceLabel.includes(' ') ? deviceLabel.split(' ', 2)[1] : deviceLabel;
+        const numDevices = parseInt($('#configNumDevices').val()) || 1;
+        const powerW = parseFloat($('#configPowerW').val()) || 100;
+        const totalPowerW = numDevices * powerW;
+        
+        if (category === 'elec_flex' && typeof Plotly !== 'undefined') {
+            const startTime = $('#configStartTime').val() || '20:00';
+            const durationMin = parseInt($('#configDurationMin').val()) || 90;
+            
+            // Recalculate end time from start + duration to ensure it's correct
+            let endTime = $('#configEndTime').val();
+            if (startTime) {
+                const [startHours, startMinutes] = startTime.split(':');
+                const startDate = new Date(2025, 0, 10, parseInt(startHours), parseInt(startMinutes));
+                const endDate = new Date(startDate.getTime() + (durationMin * 60000));
+                const endHours = String(endDate.getHours()).padStart(2, '0');
+                const endMinutes = String(endDate.getMinutes()).padStart(2, '0');
+                endTime = `${endHours}:${endMinutes}`;
+                
+                // Update the end time input if it's different
+                if ($('#configEndTime').val() !== endTime) {
+                    $('#configEndTime').val(endTime);
+                }
+            } else {
+                endTime = endTime || '21:30';
+            }
+            
+            console.log('DEBUG updateProfilePreview elec_flex:', {
+                startTime: startTime,
+                endTime: endTime,
+                durationMin: durationMin,
+                numDevices: numDevices,
+                powerW: powerW,
+                totalPowerW: totalPowerW
+            });
+            
+            if (!startTime || !endTime) {
+                console.warn('Missing start or end time for preview');
+                return;
+            }
+            
+            // Generate full 24-hour profile (matching build_minute_profile behavior)
+            // Create 1-minute resolution for the full day
+            const dummyDay = new Date(2025, 0, 10, 0, 0, 0);
+            const times = [];
+            const values = [];
+            
+            // Generate all 1440 minutes (24 hours * 60 minutes)
+            for (let i = 0; i < 24 * 60; i++) {
+                const time = new Date(dummyDay.getTime() + i * 60000);
+                times.push(time);
+                
+                // Calculate minutes since midnight
+                const minutesSinceMidnight = i;
+                
+                // Parse start and end times to minutes since midnight
+                const [startHours, startMinutes] = startTime.split(':').map(Number);
+                const [endHours, endMinutes] = endTime.split(':').map(Number);
+                const startMin = startHours * 60 + startMinutes;
+                let endMin = endHours * 60 + endMinutes;
+                
+                // Handle wrap-around (if end < start, it crosses midnight)
+                if (endMin <= startMin) {
+                    // Power is ON if: (minutes >= startMin) OR (minutes < endMin)
+                    if (minutesSinceMidnight >= startMin || minutesSinceMidnight < endMin) {
+                        values.push(totalPowerW / 1000); // Convert to kW
+                    } else {
+                        values.push(0);
+                    }
+                } else {
+                    // Normal case: start < end
+                    if (minutesSinceMidnight >= startMin && minutesSinceMidnight < endMin) {
+                        values.push(totalPowerW / 1000); // Convert to kW
+                    } else {
+                        values.push(0);
+                    }
+                }
+            }
+            
+            console.log('DEBUG updateProfilePreview: generated full 24h profile with', 
+                values.filter(v => v > 0).length, 'active minutes from', startTime, 'to', endTime);
+            
+            const trace = {
+                x: times,
+                y: values,
+                mode: 'lines',
+                type: 'scatter',
+                name: 'Power',
+                line: {color: 'blue', width: 2},
+                fill: 'tozeroy'
+            };
+            
+            Plotly.newPlot('profilePreview', [trace], {
+                title: `${deviceName} profile`,
+                xaxis: {
+                    title: 'Time',
+                    type: 'date',
+                    tickformat: '%H:%M'
+                },
+                yaxis: {title: 'kW'},
+                height: 150,
+                margin: {l: 50, r: 10, t: 30, b: 40}
+            }, {responsive: true, displayModeBar: false});
+        } else if (category === 'elec_fixed' && typeof Plotly !== 'undefined') {
+            // Build profile from intervals
+            const intervals = [];
+            $('#intervalsContainer .interval-row').each(function() {
+                const start = $(this).find('.interval-start').val();
+                const end = $(this).find('.interval-end').val();
+                if (start && end) {
+                    intervals.push({start: start, end: end});
+                }
+            });
+            
+            console.log('Updating fixed device preview with intervals:', intervals);
+            
+            if (intervals.length === 0) {
+                // Show empty chart if no intervals
+            Plotly.newPlot('profilePreview', [], {
+                title: `${deviceName} profile`,
+                    xaxis: {title: 'Time'},
+                    yaxis: {title: 'kW'},
+                    height: 150,
+                    margin: {l: 50, r: 10, t: 30, b: 40}
+                }, {responsive: true, displayModeBar: false});
+                return;
+            }
+            
+            // Create 24-hour minute-by-minute profile
+            const times = [];
+            const values = [];
+            for (let h = 0; h < 24; h++) {
+                for (let m = 0; m < 60; m++) {
+                    const timeStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+                    times.push(new Date(2025, 0, 10, h, m));
+                    
+                    let isOn = false;
+                    for (const iv of intervals) {
+                        const startTime = iv.start;
+                        const endTime = iv.end;
+                        // Handle wrap-around (e.g., 22:00 to 06:00)
+                        if (startTime > endTime) {
+                            // Wraps midnight
+                            if (timeStr >= startTime || timeStr < endTime) {
+                                isOn = true;
+                                break;
+                            }
+                        } else {
+                            // Normal interval
+                            if (timeStr >= startTime && timeStr < endTime) {
+                                isOn = true;
+                                break;
+                            }
+                        }
+                    }
+                    values.push(isOn ? totalPowerW / 1000 : 0);
+                }
+            }
+            
+            const trace = {
+                x: times,
+                y: values,
+                mode: 'lines',
+                type: 'scatter',
+                name: 'Power',
+                line: {color: 'blue', width: 2},
+                fill: 'tozeroy'
+            };
+            
+            Plotly.newPlot('profilePreview', [trace], {
+                title: `${deviceName} profile`,
+                xaxis: {title: 'Time'},
+                yaxis: {title: 'kW'},
+                height: 150,
+                margin: {l: 50, r: 10, t: 30, b: 40},
+                showlegend: false
+            }, {responsive: true, displayModeBar: false});
+        }
+    }
+    
+    $('#saveDeviceConfig').on('click', function() {
+        const modalBody = $('#deviceConfigModalBody');
+        const fullKey = modalBody.data('full-key');
+        const devType = modalBody.data('dev-type');
+        const category = modalBody.data('category');
+        
+        let config = {};
+        
+        // Handle thermal devices differently
+        if (category === 'thermal') {
+            if (devType === 'space_heat') {
+                const spaceMode = $('#modalSpaceMode').val();
+                config = {
+                    space_mode: spaceMode,
+                    t_min_c: parseFloat($('#modalSpaceTempMin').val()) || 20,
+                    t_max_c: parseFloat($('#modalSpaceTempMax').val()) || 22,
+                    q_kw: parseFloat($('#modalSpaceHeaterKw').val()) || 6,
+                    hp_type: $('input[name="modalHpType"]:checked').val() || 'Fixed power',
+                    distribution: $('#modalHeatDistribution').val() || 'Radiators'
+                };
+            } else if (devType === 'dhw') {
+                const dhwMode = $('#modalDhwMode').val();
+                config = {
+                    dhw_mode: dhwMode,
+                    volume_l: parseFloat($('#modalDhwVolume').val()) || 200,
+                    usage_level: $('#modalDhwUsage').val() || 'Medium',
+                    t_min_c: parseFloat($('#modalDhwTempMin').val()) || 45,
+                    t_max_c: parseFloat($('#modalDhwTempMax').val()) || 55,
+                    p_el_kw: parseFloat($('#modalDhwHeaterKw').val()) || 2
+                };
+            } else if (devType === 'leisure') {
+                // Collect hot tub sessions
+                const htSessions = [];
+                $('#modalHtSessionsList .ht-session-row').each(function() {
+                    const start = $(this).find('.ht-session-start').val();
+                    const end = $(this).find('.ht-session-end').val();
+                    if (start && end) {
+                        htSessions.push({start: start, end: end});
+                    }
+                });
+                
+                config = {
+                    hot_tub_enabled: $('#modalHotTubEnabled').is(':checked'),
+                    pool_enabled: $('#modalPoolEnabled').is(':checked'),
+                    ht_target_c: parseFloat($('#modalHtTargetTemp').val()) || 40,
+                    ht_idle_c: parseFloat($('#modalHtIdleTemp').val()) || 30,
+                    ht_water_l: parseFloat($('#modalHtVolume').val()) || 1200,
+                    ht_heater_kw: parseFloat($('#modalHtHeaterKw').val()) || 5,
+                    ht_sessions: htSessions,
+                    pool_target_c: parseFloat($('#modalPoolTargetTemp').val()) || 28,
+                    pool_idle_c: parseFloat($('#modalPoolIdleTemp').val()) || 24,
+                    pool_water_l: parseFloat($('#modalPoolVolume').val()) || 30000,
+                    pool_heater_kw: parseFloat($('#modalPoolHeaterKw').val()) || 15
+                };
+            }
+            
+            // Save thermal config
+            console.log('Saving thermal config:', fullKey, config);
+            
+            // Show loading on button
+            const saveBtn = $('#saveDeviceConfig');
+            const originalBtnText = saveBtn.html();
+            saveBtn.prop('disabled', true).html('<span class="spinner-border spinner-border-sm me-2"></span>Saving...');
+            
+            $.ajax({
+                url: '/api/save-device-config',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({full_key: fullKey, config: config}),
+                success: function(response) {
+                    console.log('Thermal config save response:', response);
+                    saveBtn.prop('disabled', false).html(originalBtnText);
+                    
+                    // Hide the modal
+                    const modalEl = document.getElementById('deviceConfigModal');
+                    const modal = bootstrap.Modal.getInstance(modalEl);
+                    if (modal) {
+                        modal.hide();
+                    }
+                    
+                    showAlert('Thermal device configuration saved!', 'success');
+                    // Trigger thermal preview computation for summary panel
+                    computeThermalPreview(devType);
+                    updateVisualizations();
+                },
+                error: function(xhr) {
+                    console.error('Error saving thermal config:', xhr);
+                    saveBtn.prop('disabled', false).html(originalBtnText);
+                    showAlert('Failed to save thermal configuration: ' + (xhr.responseJSON?.error || 'Unknown error'), 'danger');
+                }
+            });
+            return; // Exit early for thermal devices
+        }
+        
+        // Non-thermal device config
+        config = {
+            num_devices: parseInt($('#configNumDevices').val()),
+            power_w: parseFloat($('#configPowerW').val()),
+            power_kw: parseFloat($('#configPowerW').val()) / 1000.0
+        };
+        
+        // Custom name for "other*" devices
+        if (devType.startsWith('other')) {
+            const customName = $('#configCustomName').val().trim();
+            if (customName) {
+                config.custom_name = customName;
+            }
+        }
+        
+        if (category === 'elec_flex') {
+            config.duration_min = parseInt($('#configDurationMin').val());
+            // Use global preference from flexible settings
+            config.w_cost = parseFloat($('#flexWCost').val()) || 1.0;
+            const startTime = $('#configStartTime').val();
+            const endTime = $('#configEndTime').val();
+            config.intervals = [{
+                start: startTime,
+                end: endTime
+            }];
+            // Also save start for compatibility
+            config.start = startTime;
+        } else if (category === 'elec_fixed') {
+            const intervals = [];
+            $('#intervalsContainer .interval-row').each(function() {
+                const start = $(this).find('.interval-start').val();
+                const end = $(this).find('.interval-end').val();
+                if (start && end) {
+                    intervals.push({start: start, end: end});
+                }
+            });
+            config.intervals = intervals.length > 0 ? intervals : [{'start': '18:00', 'end': '23:00'}];
+        }
+        
+        $.ajax({
+            url: '/api/save-device-config',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({full_key: fullKey, config: config}),
+            success: function() {
+                $('#deviceConfigModal').modal('hide');
+                showAlert('Device configuration saved!', 'success');
+                // Update device label if custom name was set
+                if (devType.startsWith('other') && config.custom_name) {
+                    const deviceCheckbox = $(`#device_${fullKey.replace(/:/g, '_')}`);
+                    const deviceLabel = deviceCheckbox.closest('.form-check').find('label');
+                    const emoji = deviceLabel.text().split(' ')[0];
+                    deviceLabel.text(`${emoji} ${config.custom_name}`);
+                }
+                updateVisualizations();
+            }
+        });
+    });
+    
+    function updateFlexibleDevicesScheduleList() {
+        // Only update if we're on the flexible devices section
+        if ($('#flexibleDevicesScheduleList').length === 0) {
+            return;
+        }
+        
+        const listContainer = $('#flexibleDevicesScheduleList');
+        const deviceLabels = {{ device_categories | tojson }};
+        
+        // Get all selected flexible devices
+        const selectedFlexDevices = [];
+        $('.device-checkbox:checked').each(function() {
+            const fullKey = $(this).data('full-key');
+            const category = $(this).data('category');
+            if (category === 'elec_flex') {
+                const [catKey, devType] = fullKey.split(':');
+                const label = deviceLabels[catKey]?.devices?.find(d => d[0] === devType)?.[1] || devType;
+                selectedFlexDevices.push({fullKey: fullKey, devType: devType, label: label});
+            }
+        });
+        
+        if (selectedFlexDevices.length === 0) {
+            listContainer.html('<p class="text-muted mb-0"><em>No flexible devices selected yet.</em></p>');
+            return;
+        }
+        
+        // Fetch configs for all selected devices
+        let completed = 0;
+        const deviceSchedules = [];
+        
+        selectedFlexDevices.forEach(function(device) {
+            $.ajax({
+                url: '/api/get-device-config',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({
+                    full_key: device.fullKey,
+                    dev_type: device.devType,
+                    category: 'elec_flex'
+                }),
+                success: function(configResponse) {
+                    const config = configResponse.config || {};
+                    let scheduleText = 'Not scheduled';
+                    let durationText = '';
+                    
+                    if (config.intervals && config.intervals.length > 0) {
+                        const interval = config.intervals[0];
+                        scheduleText = `${interval.start} – ${interval.end}`;
+                    } else if (config.start) {
+                        const durationMin = config.duration_min || 90;
+                        const [startHours, startMinutes] = config.start.split(':').map(Number);
+                        const startDate = new Date(2025, 0, 10, startHours, startMinutes);
+                        const endDate = new Date(startDate.getTime() + durationMin * 60000);
+                        const endHours = String(endDate.getHours()).padStart(2, '0');
+                        const endMinutes = String(endDate.getMinutes()).padStart(2, '0');
+                        scheduleText = `${config.start} – ${endHours}:${endMinutes}`;
+                    }
+                    
+                    if (config.duration_min) {
+                        durationText = ` (${config.duration_min} min)`;
+                    }
+                    
+                    deviceSchedules.push({
+                        label: device.label,
+                        schedule: scheduleText,
+                        duration: durationText
+                    });
+                    
+                    completed++;
+                    if (completed === selectedFlexDevices.length) {
+                        renderScheduleList(deviceSchedules);
+                    }
+                },
+                error: function() {
+                    deviceSchedules.push({
+                        label: device.label,
+                        schedule: 'Not scheduled',
+                        duration: ''
+                    });
+                    completed++;
+                    if (completed === selectedFlexDevices.length) {
+                        renderScheduleList(deviceSchedules);
+                    }
+                }
+            });
+        });
+        
+        function renderScheduleList(schedules) {
+            if (schedules.length === 0) {
+                listContainer.html('<p class="text-muted mb-0"><em>No flexible devices selected yet.</em></p>');
+                return;
+            }
+            
+            // Sort alphabetically by device label, but put "Other" devices at the end
+            schedules.sort(function(a, b) {
+                // Check if label contains "Other" (handles emoji prefix)
+                const aIsOther = a.label.toLowerCase().includes('other');
+                const bIsOther = b.label.toLowerCase().includes('other');
+                
+                // If one is "Other" and one isn't, put "Other" at the end
+                if (aIsOther && !bIsOther) return 1;
+                if (!aIsOther && bIsOther) return -1;
+                
+                // Otherwise sort alphabetically
+                return a.label.localeCompare(b.label);
+            });
+            
+            let html = '<div class="row g-2">';
+            schedules.forEach(function(item) {
+                html += `
+                    <div class="col-6">
+                        <div class="py-1">
+                            <strong class="d-block small text-truncate">${item.label}</strong>
+                            <small class="text-muted">${item.schedule}${item.duration}</small>
+                        </div>
+                    </div>
+                `;
+            });
+            html += '</div>';
+            listContainer.html(html);
+        }
+    }
+    
+    function updateVisualizations() {
+        // Update flexible devices schedule list
+        updateFlexibleDevicesScheduleList();
+        
+        // Update house layout
+        $.ajax({
+            url: '/api/house-layout',
+            method: 'GET',
+            success: function(response) {
+                if (response.success && typeof Plotly !== 'undefined') {
+                    Plotly.newPlot('houseLayoutChart', response.figure.data, response.figure.layout, {
+                        responsive: true,
+                        displayModeBar: false
+                    });
+                }
+            },
+            error: function(xhr) {
+                console.error('Error loading house layout:', xhr);
+            }
+        });
+        
+        // Update daily profiles
+        $.ajax({
+            url: '/api/compute-profiles',
+            method: 'GET',
+            success: function(response) {
+                if (response.success && typeof Plotly !== 'undefined') {
+                    const traces = [];
+                    const deviceLabels = {{ device_categories | tojson }};
+                    
+                    // Add all device traces
+                    for (const [fullKey, profile] of Object.entries(response.profiles)) {
+                        const [catKey, devType] = fullKey.split(':');
+                        if (catKey === 'gen_store' && devType === 'pv') {
+                            continue; // Skip PV for now (will add separately)
+                        }
+                        
+                        const label = deviceLabels[catKey]?.devices?.find(d => d[0] === devType)?.[1] || fullKey;
+                        traces.push({
+                            x: profile.index,
+                            y: profile.values,
+                            mode: 'lines',
+                            name: label,
+                            type: 'scatter'
+                        });
+                    }
+                    
+                    // Add total trace
+                    traces.push({
+                        x: response.total.index,
+                        y: response.total.values,
+                        mode: 'lines',
+                        name: 'Total',
+                        line: {color: 'black', width: 2},
+                        type: 'scatter'
+                    });
+                    
+                    const layout = {
+                        title: 'Daily Power Profiles',
+                        xaxis: {title: 'Time'},
+                        yaxis: {title: 'Power (kW)'},
+                        height: 400,
+                        margin: {l: 60, r: 20, t: 40, b: 60},
+                        hovermode: 'x unified',
+                        legend: {orientation: 'h', y: -0.2}
+                    };
+                    
+                    Plotly.newPlot('dailyProfilesChart', traces, layout, {
+                        responsive: true,
+                        displayModeBar: false
+                    });
+                }
+            },
+            error: function(xhr) {
+                console.error('Error loading profiles:', xhr);
+            }
+        });
+    }
+    
+    function showAlert(message, type) {
+        const alert = `<div class="alert alert-${type} alert-dismissible fade show" role="alert">
+            ${message}
+            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        </div>`;
+        $('.container').prepend(alert);
+        setTimeout(function() {
+            $('.alert').fadeOut();
+        }, 3000);
+    }
+    
+    // =====================================================
+    // THERMAL DEVICES UTILITY FUNCTIONS
+    // (Handlers are now in setupThermalModalHandlers)
+    // =====================================================
+    
+    function hasThermalLoad(devType, config) {
+        if (devType === 'space_heat') {
+            return config.space_mode !== 'None (external supply)';
+        } else if (devType === 'dhw') {
+            return config.dhw_mode !== 'None (external supply)';
+        } else if (devType === 'leisure') {
+            return config.hot_tub_enabled || config.pool_enabled;
+        }
+        return false;
+    }
+    
+    // Compute and show preview for a single thermal device (updates summary panel mini chart)
+    function computeThermalPreview(devType) {
+        // Update summary panel mini charts
+        const chartId = devType === 'space_heat' ? 'spaceHeatingMiniChart' : 
+                        devType === 'dhw' ? 'dhwMiniChart' : 'leisureMiniChart';
+        const summaryId = devType === 'space_heat' ? 'spaceHeatingSummary' : 
+                         devType === 'dhw' ? 'dhwSummary' : 'leisureSummary';
+        const color = devType === 'space_heat' ? '#dc3545' : 
+                      devType === 'dhw' ? '#0dcaf0' : '#198754';
+        
+        // Show loading in mini chart (only if empty or showing placeholder)
+        const currentContent = $(`#${chartId}`).html();
+        if (!currentContent || currentContent.includes('Configure') || currentContent.trim() === '') {
+            $(`#${chartId}`).html('<div class="text-center py-2"><div class="spinner-border spinner-border-sm text-secondary"></div></div>');
+        }
+        
+        // Get device config for summary text
+        $.ajax({
+            url: '/api/get-device-config',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({
+                full_key: `thermal:${devType}`,
+                dev_type: devType,
+                category: 'thermal'
+            }),
+            success: function(configResponse) {
+                let summaryText = '';
+                const cfg = configResponse.config || {};
+                
+                if (devType === 'space_heat') {
+                    const mode = cfg.space_mode || 'None (external supply)';
+                    if (mode === 'None (external supply)') {
+                        summaryText = '<span class="text-muted">External supply (no electric load)</span>';
+                    } else {
+                        summaryText = `<strong>${mode}</strong><br><small class="text-muted">${cfg.t_min_c || 20}–${cfg.t_max_c || 22}°C, ${cfg.q_kw || 6} kW</small>`;
+                    }
+                } else if (devType === 'dhw') {
+                    const mode = cfg.dhw_mode || 'None (external supply)';
+                    if (mode === 'None (external supply)') {
+                        summaryText = '<span class="text-muted">External supply (no electric load)</span>';
+                    } else {
+                        summaryText = `<strong>${mode}</strong><br><small class="text-muted">${cfg.volume_l || 200}L, ${cfg.usage_level || 'Medium'} usage</small>`;
+                    }
+                } else if (devType === 'leisure') {
+                    const htEnabled = cfg.hot_tub_enabled || false;
+                    const poolEnabled = cfg.pool_enabled || false;
+                    if (!htEnabled && !poolEnabled) {
+                        summaryText = '<span class="text-muted">No leisure devices enabled</span>';
+                    } else {
+                        const parts = [];
+                        if (htEnabled) parts.push(`🛁 Hot tub (${cfg.ht_target_c || 40}°C)`);
+                        if (poolEnabled) parts.push(`🏊 Pool (${cfg.pool_target_c || 28}°C)`);
+                        summaryText = parts.join('<br>');
+                    }
+                }
+                $(`#${summaryId}`).html(summaryText);
+            }
+        });
+        
+        // Call the compute endpoint for mini chart
+        $.ajax({
+            url: '/api/compute-thermal-profiles',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({}),
+            success: function(response) {
+                const chartElement = $(`#${chartId}`);
+                if (!chartElement.length) return; // Safety check
+                
+                if (response.success && response.profiles && response.profiles[devType] && typeof Plotly !== 'undefined') {
+                    const profile = response.profiles[devType];
+                    if (profile.index && profile.values && profile.values.length > 0) {
+                        // Parse index as dates
+                        const times = profile.index.map(t => new Date(t));
+                        
+                        Plotly.newPlot(chartId, [{
+                            x: times,
+                            y: profile.values,
+                            mode: 'lines',
+                            type: 'scatter',
+                            line: {color: color, width: 1.5},
+                            fill: 'tozeroy'
+                        }], {
+                            margin: {l: 30, r: 5, t: 5, b: 25},
+                            xaxis: {tickformat: '%H:%M', tickfont: {size: 9}, nticks: 5, type: 'date'},
+                            yaxis: {title: 'kW', titlefont: {size: 9}, tickfont: {size: 9}},
+                            height: 80
+                        }, {responsive: true, displayModeBar: false});
+                    } else {
+                        chartElement.html('<div class="text-center text-muted small py-2">—</div>');
+                    }
+                } else if (!response.success) {
+                    chartElement.html('<div class="text-center text-muted small py-2">Fetch weather first</div>');
+                } else {
+                    // No profile for this device type (e.g., set to "None")
+                    chartElement.html('<div class="text-center text-muted small py-2">—</div>');
+                }
+            },
+            error: function(xhr) {
+                console.error('Error computing thermal preview:', xhr);
+                $(`#${chartId}`).html('<div class="text-center text-muted small py-2">—</div>');
+            }
+        });
+    }
+    
+    // Legacy handler for old button ID (backwards compatibility)
+    $('#computeThermalProfiles').on('click', function() {
+        const btn = $(this);
+        btn.prop('disabled', true).html('<span class="spinner-border spinner-border-sm me-2"></span>Computing...');
+        
+        $.ajax({
+            url: '/api/compute-thermal-profiles',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({}),
+            success: function(response) {
+                if (response.success) {
+                    showAlert('Thermal profiles computed successfully!', 'success');
+                    updateVisualizations();
+                    
+                    // Update mini charts in summary panel
+                    if (response.profiles && typeof Plotly !== 'undefined') {
+                        if (response.profiles.space_heat && response.profiles.space_heat.index) {
+                            const times = response.profiles.space_heat.index.map(t => new Date(t));
+                            Plotly.newPlot('spaceHeatingMiniChart', [{
+                                x: times,
+                                y: response.profiles.space_heat.values,
+                                mode: 'lines',
+                                type: 'scatter',
+                                line: {color: '#dc3545', width: 1.5},
+                                fill: 'tozeroy'
+                            }], {
+                                margin: {l: 30, r: 5, t: 5, b: 25},
+                                xaxis: {tickformat: '%H:%M', tickfont: {size: 9}, type: 'date'},
+                                yaxis: {title: 'kW', titlefont: {size: 9}, tickfont: {size: 9}},
+                                height: 80
+                            }, {responsive: true, displayModeBar: false});
+                        }
+                        
+                        if (response.profiles.dhw && response.profiles.dhw.index) {
+                            const times = response.profiles.dhw.index.map(t => new Date(t));
+                            Plotly.newPlot('dhwMiniChart', [{
+                                x: times,
+                                y: response.profiles.dhw.values,
+                                mode: 'lines',
+                                type: 'scatter',
+                                line: {color: '#0dcaf0', width: 1.5},
+                                fill: 'tozeroy'
+                            }], {
+                                margin: {l: 30, r: 5, t: 5, b: 25},
+                                xaxis: {tickformat: '%H:%M', tickfont: {size: 9}, type: 'date'},
+                                yaxis: {title: 'kW', titlefont: {size: 9}, tickfont: {size: 9}},
+                                height: 80
+                            }, {responsive: true, displayModeBar: false});
+                        }
+                        
+                        if (response.profiles.leisure && response.profiles.leisure.index) {
+                            const times = response.profiles.leisure.index.map(t => new Date(t));
+                            Plotly.newPlot('leisureMiniChart', [{
+                                x: times,
+                                y: response.profiles.leisure.values,
+                                mode: 'lines',
+                                type: 'scatter',
+                                line: {color: '#198754', width: 1.5},
+                                fill: 'tozeroy'
+                            }], {
+                                margin: {l: 30, r: 5, t: 5, b: 25},
+                                xaxis: {tickformat: '%H:%M', tickfont: {size: 9}, type: 'date'},
+                                yaxis: {title: 'kW', titlefont: {size: 9}, tickfont: {size: 9}},
+                                height: 80
+                            }, {responsive: true, displayModeBar: false});
+                        }
+                    }
+                } else {
+                    showAlert('Failed to compute thermal profiles: ' + (response.error || 'Unknown error'), 'danger');
+                }
+                btn.prop('disabled', false).html('<i class="bi bi-calculator me-2"></i>Compute Profiles');
+            },
+            error: function(xhr) {
+                showAlert('Error computing thermal profiles. Make sure weather data is fetched on page 1.', 'danger');
+                btn.prop('disabled', false).html('<i class="bi bi-calculator me-2"></i>Compute Profiles');
+            }
+        });
+    });
+    
+    // Track loading state for thermal summaries
+    let thermalSummariesLoading = false;
+    
+    // Load thermal summaries on page load
+    function loadThermalSummaries() {
+        if (thermalSummariesLoading) return;
+        thermalSummariesLoading = true;
+        
+        // Load summaries sequentially to avoid race conditions
+        let deviceIndex = 0;
+        const devices = ['space_heat', 'dhw', 'leisure'];
+        
+        function loadNextDevice() {
+            if (deviceIndex >= devices.length) {
+                thermalSummariesLoading = false;
+                return;
+            }
+            
+            const devType = devices[deviceIndex];
+            deviceIndex++;
+            
+            // Update the summary text and mini chart
+            computeThermalPreviewSequential(devType, loadNextDevice);
+        }
+        
+        loadNextDevice();
+    }
+    
+    // Sequential version that calls callback when done
+    function computeThermalPreviewSequential(devType, callback) {
+        const chartId = devType === 'space_heat' ? 'spaceHeatingMiniChart' : 
+                        devType === 'dhw' ? 'dhwMiniChart' : 'leisureMiniChart';
+        const summaryId = devType === 'space_heat' ? 'spaceHeatingSummary' : 
+                         devType === 'dhw' ? 'dhwSummary' : 'leisureSummary';
+        const color = devType === 'space_heat' ? '#dc3545' : 
+                      devType === 'dhw' ? '#0dcaf0' : '#198754';
+        
+        // Get device config for summary text
+        $.ajax({
+            url: '/api/get-device-config',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({
+                full_key: `thermal:${devType}`,
+                dev_type: devType,
+                category: 'thermal'
+            }),
+            success: function(configResponse) {
+                let summaryText = '';
+                const cfg = configResponse.config || {};
+                
+                if (devType === 'space_heat') {
+                    const mode = cfg.space_mode || 'None (external supply)';
+                    if (mode === 'None (external supply)') {
+                        summaryText = '<span class="text-muted">External supply (no electric load)</span>';
+                        $(`#${chartId}`).html('<div class="text-center text-muted small py-2">—</div>');
+                    } else {
+                        summaryText = `<strong>${mode}</strong><br><small class="text-muted">${cfg.t_min_c || 20}–${cfg.t_max_c || 22}°C, ${cfg.q_kw || 6} kW</small>`;
+                    }
+                } else if (devType === 'dhw') {
+                    const mode = cfg.dhw_mode || 'None (external supply)';
+                    if (mode === 'None (external supply)') {
+                        summaryText = '<span class="text-muted">External supply (no electric load)</span>';
+                        $(`#${chartId}`).html('<div class="text-center text-muted small py-2">—</div>');
+                    } else {
+                        summaryText = `<strong>${mode}</strong><br><small class="text-muted">${cfg.volume_l || 200}L, ${cfg.usage_level || 'Medium'} usage</small>`;
+                    }
+                } else if (devType === 'leisure') {
+                    const htEnabled = cfg.hot_tub_enabled || false;
+                    const poolEnabled = cfg.pool_enabled || false;
+                    if (!htEnabled && !poolEnabled) {
+                        summaryText = '<span class="text-muted">No leisure devices enabled</span>';
+                        $(`#${chartId}`).html('<div class="text-center text-muted small py-2">—</div>');
+                    } else {
+                        const parts = [];
+                        if (htEnabled) parts.push(`🛁 Hot tub (${cfg.ht_target_c || 40}°C)`);
+                        if (poolEnabled) parts.push(`🏊 Pool (${cfg.pool_target_c || 28}°C)`);
+                        summaryText = parts.join('<br>');
+                    }
+                }
+                $(`#${summaryId}`).html(summaryText);
+            }
+        });
+        
+        // Compute thermal profile
+        $.ajax({
+            url: '/api/compute-thermal-profiles',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({}),
+            success: function(response) {
+                const chartElement = $(`#${chartId}`);
+                if (!chartElement.length) {
+                    if (callback) callback();
+                    return;
+                }
+                
+                if (response.success && response.profiles && response.profiles[devType] && typeof Plotly !== 'undefined') {
+                    const profile = response.profiles[devType];
+                    if (profile.index && profile.values && profile.values.length > 0) {
+                        const times = profile.index.map(t => new Date(t));
+                        
+                        Plotly.newPlot(chartId, [{
+                            x: times,
+                            y: profile.values,
+                            mode: 'lines',
+                            type: 'scatter',
+                            line: {color: color, width: 1.5},
+                            fill: 'tozeroy'
+                        }], {
+                            margin: {l: 30, r: 5, t: 5, b: 25},
+                            xaxis: {tickformat: '%H:%M', tickfont: {size: 9}, nticks: 5, type: 'date'},
+                            yaxis: {title: 'kW', titlefont: {size: 9}, tickfont: {size: 9}},
+                            height: 80
+                        }, {responsive: true, displayModeBar: false});
+                    } else {
+                        chartElement.html('<div class="text-center text-muted small py-2">—</div>');
+                    }
+                } else if (!response.success) {
+                    chartElement.html('<div class="text-center text-muted small py-2">Fetch weather first</div>');
+                } else {
+                    chartElement.html('<div class="text-center text-muted small py-2">—</div>');
+                }
+                
+                if (callback) callback();
+            },
+            error: function() {
+                $(`#${chartId}`).html('<div class="text-center text-muted small py-2">—</div>');
+                if (callback) callback();
+            }
+        });
+    }
+    
+    // Load thermal summaries on page load (with a small delay to ensure DOM is ready)
+    setTimeout(loadThermalSummaries, 500);
+    
+    // Initial visualization update
+    updateVisualizations();
+});
+</script>
+{% endblock %}

@@ -1,0 +1,274 @@
+{% extends "base.html" %}
+
+{% block title %}Admin - Daily EMS Sandbox{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+            <h1 class="mb-0">🔐 Admin – App Usage Statistics</h1>
+            <p class="text-muted mb-0">Monitor application usage and user analytics</p>
+        </div>
+        <a href="{{ url_for('scenario') }}" class="btn btn-primary">
+            <i class="bi bi-arrow-left"></i> Return to User Mode
+        </a>
+    </div>
+    
+    {% if not stats %}
+    <div class="alert alert-info">
+        <i class="bi bi-info-circle me-2"></i>No usage data recorded yet.
+    </div>
+    {% else %}
+    <!-- Summary Cards -->
+    <div class="row mb-4">
+        <div class="col-md-3">
+            <div class="card text-center border-primary">
+                <div class="card-body">
+                    <div class="mb-2">
+                        <i class="bi bi-mouse text-primary" style="font-size: 2rem;"></i>
+                    </div>
+                    <h2 class="mb-1 text-primary">{{ stats.total_clicks }}</h2>
+                    <p class="text-muted mb-0 small">Total Clicks</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card text-center border-success">
+                <div class="card-body">
+                    <div class="mb-2">
+                        <i class="bi bi-people text-success" style="font-size: 2rem;"></i>
+                    </div>
+                    <h2 class="mb-1 text-success">{{ stats.unique_sessions }}</h2>
+                    <p class="text-muted mb-0 small">Unique Sessions</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card text-center border-info">
+                <div class="card-body">
+                    <div class="mb-2">
+                        <i class="bi bi-geo-alt text-info" style="font-size: 2rem;"></i>
+                    </div>
+                    <h2 class="mb-1 text-info">{{ stats.unique_locations }}</h2>
+                    <p class="text-muted mb-0 small">Unique Locations</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card text-center border-warning">
+                <div class="card-body">
+                    <div class="mb-2">
+                        <i class="bi bi-building text-warning" style="font-size: 2rem;"></i>
+                    </div>
+                    <h2 class="mb-1 text-warning">{{ stats.occupation_counts|length }}</h2>
+                    <p class="text-muted mb-0 small">Occupation Types</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Charts Row -->
+    <div class="row mb-4">
+        <div class="col-md-6">
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5 class="mb-0"><i class="bi bi-bar-chart me-2"></i>Usage by Occupation</h5>
+                </div>
+                <div class="card-body">
+                    <div id="occupationChart" style="height: 400px;"></div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-6">
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5 class="mb-0"><i class="bi bi-graph-up me-2"></i>Usage Over Time</h5>
+                </div>
+                <div class="card-body">
+                    <div id="timeChart" style="height: 400px;"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Location Distribution Chart -->
+    <div class="card mb-4">
+        <div class="card-header">
+            <h5 class="mb-0"><i class="bi bi-pie-chart me-2"></i>Location Distribution</h5>
+        </div>
+        <div class="card-body">
+            <div id="locationChart" style="height: 400px;"></div>
+        </div>
+    </div>
+    
+    <!-- Raw Usage Log -->
+    <div class="card mb-4">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <h5 class="mb-0"><i class="bi bi-table me-2"></i>Raw Usage Log</h5>
+            <a href="{{ url_for('download_log') }}" class="btn btn-sm btn-outline-primary">
+                <i class="bi bi-download"></i> Download CSV
+            </a>
+        </div>
+        <div class="card-body">
+            <div class="table-responsive">
+                <table class="table table-hover">
+                    <thead>
+                        <tr>
+                            <th>Timestamp</th>
+                            <th>Occupation</th>
+                            <th>Location</th>
+                            <th>Session ID</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for row in stats.raw_log %}
+                        <tr>
+                            <td>{{ row.timestamp }}</td>
+                            <td><span class="badge bg-primary">{{ row.occupation }}</span></td>
+                            <td>{{ row.location }}</td>
+                            <td><small class="text-muted font-monospace">{{ row.session_id[:8] }}...</small></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+    function renderCharts() {
+        if (typeof Plotly === 'undefined') {
+            console.error('Plotly.js not loaded');
+            setTimeout(renderCharts, 100);
+            return;
+        }
+        
+        {% if stats %}
+        try {
+            // Occupation chart - Bar chart
+            const occupationData = {{ stats.occupation_counts | tojson }};
+            console.log('Occupation data:', occupationData);
+            
+            if (Object.keys(occupationData).length > 0) {
+                const occupationTrace = {
+                    x: Object.keys(occupationData),
+                    y: Object.values(occupationData),
+                    type: 'bar',
+                    marker: {
+                        color: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#f97316'],
+                        line: {
+                            color: 'rgba(0,0,0,0.1)',
+                            width: 1
+                        }
+                    },
+                    text: Object.values(occupationData).map(v => v.toString()),
+                    textposition: 'outside'
+                };
+                Plotly.newPlot('occupationChart', [occupationTrace], {
+                    title: {
+                        text: 'User Distribution by Occupation',
+                        font: {size: 16}
+                    },
+                    xaxis: {
+                        title: 'Occupation',
+                        tickangle: -45
+                    },
+                    yaxis: {
+                        title: 'Number of Users'
+                    },
+                    margin: {l: 60, r: 20, t: 60, b: 100},
+                    showlegend: false
+                }, {responsive: true});
+            } else {
+                document.getElementById('occupationChart').innerHTML = '<p class="text-muted text-center p-4">No occupation data available</p>';
+            }
+            
+            // Time chart - Line chart with area
+            const timeData = {{ stats.usage_over_time | tojson }};
+            console.log('Time data:', timeData);
+            
+            if (Object.keys(timeData).length > 0) {
+                const sortedDates = Object.keys(timeData).sort();
+                const timeTrace = {
+                    x: sortedDates.map(d => new Date(d)),
+                    y: sortedDates.map(d => timeData[d]),
+                    type: 'scatter',
+                    mode: 'lines+markers',
+                    fill: 'tozeroy',
+                    fillcolor: 'rgba(37, 99, 235, 0.1)',
+                    line: {
+                        color: '#2563eb',
+                        width: 3
+                    },
+                    marker: {
+                        color: '#2563eb',
+                        size: 8
+                    }
+                };
+                Plotly.newPlot('timeChart', [timeTrace], {
+                    title: {
+                        text: 'Daily Usage Trend',
+                        font: {size: 16}
+                    },
+                    xaxis: {
+                        title: 'Date',
+                        type: 'date'
+                    },
+                    yaxis: {
+                        title: 'Number of Clicks'
+                    },
+                    margin: {l: 60, r: 20, t: 60, b: 60},
+                    showlegend: false
+                }, {responsive: true});
+            } else {
+                document.getElementById('timeChart').innerHTML = '<p class="text-muted text-center p-4">No time series data available</p>';
+            }
+            
+            // Location distribution - Pie chart
+            const locationData = {{ stats.location_counts | tojson }};
+            console.log('Location data:', locationData);
+            
+            if (Object.keys(locationData).length > 0) {
+                const locationTrace = {
+                    labels: Object.keys(locationData),
+                    values: Object.values(locationData),
+                    type: 'pie',
+                    hole: 0.4,
+                    marker: {
+                        colors: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#f97316']
+                    },
+                    textinfo: 'label+percent',
+                    textposition: 'outside'
+                };
+                Plotly.newPlot('locationChart', [locationTrace], {
+                    title: {
+                        text: 'User Distribution by Location',
+                        font: {size: 16}
+                    },
+                    margin: {l: 20, r: 20, t: 60, b: 20},
+                    showlegend: true,
+                    legend: {
+                        orientation: 'v',
+                        x: 1.05,
+                        y: 0.5
+                    }
+                }, {responsive: true});
+            } else {
+                document.getElementById('locationChart').innerHTML = '<p class="text-muted text-center p-4">No location data available</p>';
+            }
+        } catch (error) {
+            console.error('Error rendering charts:', error);
+        }
+        {% endif %}
+    }
+    
+    $(document).ready(function() {
+        // Wait a bit to ensure Plotly is loaded
+        setTimeout(renderCharts, 200);
+    });
+</script>
+{% endblock %}
