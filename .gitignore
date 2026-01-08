@@ -1,55 +1,19 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.pyc
-*.pyo
-.Python
-venv/
-env/
-ENV/
-.venv/
-
-# Node
-node_modules/
-dist/
-build/
-*.log
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Environment
-.env
-.env.local
-
-# Python
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
 
-# Virtual environments
-.venv/
-venv/
-
-# Logs / runtime data
+# Local runtime data
+flask_session/
+results/
 *.csv
 *.log
 
-# OS / editor junk
-.DS_Store
-Thumbs.db
-
-# Local secrets
+# Environments / secrets
+.venv/
+venv/
 .env
 
-# Databases (later)
-*.db
+# OS junk
+.DS_Store
+Thumbs.db
