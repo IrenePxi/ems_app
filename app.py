@@ -27,7 +27,7 @@ import uuid
 import pandas as pd
 import streamlit as st
 
-ADMIN_PASSWORD = "FCCOGEN"
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "local_debug")
 LOG_PATH = Path("usage_log.csv")
 
 def log_user_profile_to_csv(profile: dict) -> str:
